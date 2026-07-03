@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shared Mailbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/shared.css') }}">
+</head>
+<body>
+  <main class="shared-shell">
+    <div class="shared-title"><span></span>SHARED MAILBOX</div>
+    <section class="shared-card">
+      {% if invalid %}
+      <h1>链接不存在或已失效</h1>
+      <p class="muted">该共享链接不可用。</p>
+      {% else %}
+      <h1 id="mailboxTitle">读取中...</h1>
+      <div id="stateBox" class="state">读取中...</div>
+      <article id="messageCard" class="message" hidden>
+        <div class="label">最新一封邮件</div>
+        <h2 id="msgSubject"></h2>
+        <div class="meta" id="msgMeta"></div>
+        <pre id="msgBody"></pre>
+      </article>
+      <div class="footer-row">
+        <button id="refreshBtn">刷新</button>
+        <span id="cacheInfo"></span>
+      </div>
+      <p class="muted">只读共享视图 · 仅展示最新一封邮件</p>
+      {% endif %}
+    </section>
+  </main>
+  {% if not invalid %}
+  <script>
+  (function(){
+    const key = {{ shared_key|tojson }};
+    const box = document.getElementById('stateBox');
+    const card = document.getElementById('messageCard');
+    const btn = document.getElementById('refreshBtn');
+    function setText(id, text){ document.getElementById(id).textContent = text || ''; }
+    async function load(){
+      btn.disabled = true;
+      box.hidden = false;
+      box.textContent = '读取中...';
+      card.hidden = true;
+      try {
+        const res = await fetch('/api/shared/' + encodeURIComponent(key) + '/latest');
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 404) throw new Error('链接不存在或已失效');
+        if (res.status === 429) throw new Error('访问过于频繁，请稍后再试');
+        if (!res.ok || data.ok === false) throw new Error(data.error || '读取失败');
+        setText('mailboxTitle', data.mailbox || 'Shared Mailbox');
+        if (!data.message) {
+          box.textContent = data.note || '该邮箱暂无邮件，稍后刷新查看';
+          return;
+        }
+        box.hidden = true;
+        card.hidden = false;
+        setText('msgSubject', data.message.subject || '(无主题)');
+        setText('msgMeta', (data.message.from || '') + ' · ' + (data.message.date || ''));
+        setText('msgBody', data.message.body || '(无正文)');
+        setText('cacheInfo', 'fetched ' + (data.fetched_at || '') + (data.cache_age_sec == null ? '' : ' · cache ' + Math.round(data.cache_age_sec) + 's'));
+      } catch (err) {
+        box.textContent = err.message || '读取失败';
+      } finally {
+        setTimeout(() => { btn.disabled = false; }, 3000);
+      }
+    }
+    btn.addEventListener('click', load);
+    load();
+  })();
+  </script>
+  {% endif %}
+</body>
+</html>

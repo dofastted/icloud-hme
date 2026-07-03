@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>iCloud HME</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="logo"><span class="diamond-mark"></span>iCloud HME</div>
+    <button class="nav-item active" data-route="#/dashboard">仪表盘</button>
+    <button class="nav-item" data-route="#/mailboxes">邮箱列表</button>
+    <button class="nav-item" data-route="#/shared">共享管理</button>
+    <button class="nav-item" data-route="#/batch">批量创建</button>
+    <button class="nav-item" data-route="#/inbox">收件箱</button>
+    <button class="nav-item" data-route="#/docs">API 文档</button>
+    <button class="nav-item" data-route="#/logs">运行日志</button>
+    <div class="section-label">账号列表</div>
+    <div id="sidebarAccounts" class="sidebar-list"></div>
+    <button class="btn btn-outline btn-sm" data-action="add-account">添加账号</button>
+    <div class="scheduler-box">
+      <div><span id="schedDot" class="status-dot"></span><span id="schedLabel">调度器: 就绪</span></div>
+      <button class="btn btn-sm" id="btnSched" data-action="toggle-scheduler">启动调度器</button>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="crumb" id="breadcrumb">仪表盘</div>
+        <h1 id="pageTitle">仪表盘</h1>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-outline btn-sm" data-action="refresh">刷新</button>
+        <button class="btn btn-primary btn-sm" data-action="add-account">添加账号</button>
+      </div>
+    </header>
+    <section id="appView"></section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <div id="modalRoot"></div>
+  <script src="{{ url_for('static', filename='js/01-core.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/02-accounts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/03-mailboxes.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/04-shared.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/05-inbox-docs.js') }}"></script>
+</body>
+</html>
