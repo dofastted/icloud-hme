@@ -10,7 +10,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
 from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
 from shared_mailboxes import SharedMailboxStore
@@ -73,7 +73,12 @@ def _require_api_key(fn):
     return wrapper
 
 def _safe_account(account):
-    return {k:v for k,v in account.items() if k not in ("cookies","app_password")}
+    safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password")}
+    safe["has_mail_config"] = account_has_mail_config(account)
+    safe["mail_email"] = account_mail_email(account)
+    safe["mail_host"] = account_mail_host(account)
+    safe["mail_port"] = int(account.get("mail_port") or 993)
+    return safe
 
 class _RateLimiter:
     def __init__(self):
@@ -105,8 +110,69 @@ def _paginate(items, default_limit=50, max_limit=100):
     offset = max(request.args.get("offset", 0, type=int), 0)
     return items[offset:offset + limit], limit, offset
 
-def _share_url(raw_key: str) -> str:
+def _shared_entry_url() -> str:
+    exact = os.environ.get("SHARED_PUBLIC_URL", "").strip()
+    if exact:
+        return exact.rstrip("/")
+    base = (
+        os.environ.get("SHARED_PUBLIC_BASE_URL", "").strip()
+        or os.environ.get("PUBLIC_SHARED_BASE_URL", "").strip()
+    )
+    if base:
+        return base.rstrip("/") + "/shared"
+    return request.url_root.rstrip("/") + "/shared"
+
+def _legacy_share_url(raw_key: str) -> str:
     return request.url_root.rstrip("/") + "/shared/" + raw_key
+
+def _share_create_payload(created: dict, raw_key: str) -> dict:
+    return {
+        "ok": True,
+        "shared": created,
+        "redemption_code": raw_key,
+        "share_key": raw_key,
+        "share_url": _shared_entry_url(),
+        "legacy_share_url": _legacy_share_url(raw_key),
+    }
+
+def _api_base_url() -> str:
+    return request.url_root.rstrip("/") + "/api/v1"
+
+def _api_config_payload() -> dict:
+    summary = _account_mgr.get_summary()
+    available_count = len(_available_hme_items(refresh=False))
+    return {
+        "ok": True,
+        "api": {
+            "version": "v1",
+            "base_url": _api_base_url(),
+            "auth": {
+                "type": "api_key",
+                "headers": ["Authorization: Bearer <api_key>", "X-API-Key: <api_key>"],
+                "key_prefix": g.api_key.get("prefix", "") if getattr(g, "api_key", None) else "",
+            },
+            "entrypoints": {
+                "config": "/api/v1/config",
+                "available_hme": "/api/v1/hme/available",
+                "next_hme": "/api/v1/hme/available/next",
+                "hme_latest": "/api/v1/hme/{alias_email}/latest?force=0",
+                "mailbox_messages": "/api/v1/mailboxes/{alias_email}/messages?limit=1&force=0",
+                "shared_redemption_create": "/api/v1/shared-mailboxes",
+            },
+        },
+        "shared": {"entry_url": _shared_entry_url()},
+        "capabilities": {
+            "global_hme_lookup": True,
+            "latest_mail": True,
+            "refresh_mail": True,
+            "redemption_codes": True,
+        },
+        "counts": {
+            "accounts": summary.get("account_count", 0),
+            "active_accounts": summary.get("active_accounts", 0),
+            "available_hme": available_count,
+        },
+    }
 
 def _shared_not_found_response():
     return jsonify({"ok":False,"error":"not found"}), 404
@@ -167,24 +233,49 @@ def _increment_state(**kw):
         if today != _today_key: _global_state["today_created"] = 0; _today_key = today
         for k, delta in kw.items(): _global_state[k] = _global_state.get(k,0) + delta
 
+def _refresh_scheduler_account_count(account: dict) -> dict:
+    acc_id = account["id"]
+    try:
+        aliases = _account_mgr.get_aliases_for_account(acc_id)
+    except Exception as exc:
+        _emit_log("warn", f"[{account.get('name', acc_id)}] 邮箱数量刷新失败，使用本地数量: {str(exc)[:80]}")
+        return account
+    alias_total = len(aliases)
+    alias_active = sum(1 for alias in aliases if alias.get("active") or alias.get("isActive"))
+    updated = _account_mgr.update_account(acc_id, alias_total=alias_total, alias_active=alias_active, last_error=None)
+    if updated:
+        account.update(updated)
+    return account
+
+
 def _scheduler_loop():
     """后台调度器：北京时间 7:00-20:00，随机间隔 60-90min，每账号随机 3-5 个。"""
     import random as _random
     from icloud_hme import ICloudHME
     _update_state(running=True, round_status="等待触发窗口")
-    _emit_log("info", "调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个)")
+    _emit_log("info", f"调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个，单账号达到 {SCHEDULER_ALIAS_LIMIT} 跳过)")
     def _bj_hour() -> int: return (_now().hour + 8) % 24
     while not _stop_event.is_set():
         h = _bj_hour()
         if h < 7 or h >= 20: _update_state(round_status=f"非窗口时段 (BJ {h}:00)，等待..."); _stop_event.wait(1800); continue
-        active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
-        if not active_accounts: _update_state(creating=False, round_status="无活跃账号，跳过"); _stop_event.wait(1800); continue
+        accounts = _account_mgr.list_accounts()
+        active_accounts = scheduler_eligible_accounts(accounts)
+        skipped = len([a for a in accounts if a.get("status") == "active" and account_reached_scheduler_limit(a)])
+        if not active_accounts:
+            _update_state(creating=False, round_status=f"无可调度账号，已达到上限 {skipped} 个")
+            _stop_event.wait(1800)
+            continue
         round_total = 0
         for i, account in enumerate(active_accounts):
             if _stop_event.is_set(): break
             acc_id = account["id"]; acc_name = account.get("name", acc_id)
-            target_count = _random.randint(3, 5)
-            _emit_log("info", f"[{acc_name}] 本轮目标 {target_count} 个")
+            account = _refresh_scheduler_account_count(account)
+            if account_reached_scheduler_limit(account):
+                _emit_log("info", f"[{acc_name}] 已有 {account_alias_total(account)}/{SCHEDULER_ALIAS_LIMIT} 个邮箱，跳过调度")
+                continue
+            remaining = SCHEDULER_ALIAS_LIMIT - account_alias_total(account)
+            target_count = min(_random.randint(3, 5), remaining)
+            _emit_log("info", f"[{acc_name}] 本轮目标 {target_count} 个，当前 {account_alias_total(account)}/{SCHEDULER_ALIAS_LIMIT}")
             client = ICloudHME(account["cookies"], host=account.get("host","icloud.com"), verbose=False)
             created = 0; errors = 0
             while created < target_count and errors < 3 and not _stop_event.is_set():
@@ -255,7 +346,6 @@ def api_v1_accounts():
     for account in _account_mgr.list_accounts():
         item = _safe_account(account)
         item["has_cookies"] = bool(account.get("cookies"))
-        item["has_app_password"] = bool(account.get("app_password"))
         accounts.append(item)
     return jsonify({"ok":True,"accounts":accounts,"count":len(accounts)})
 
@@ -278,6 +368,23 @@ def api_v1_add_account():
 def api_v1_validate_session(acc_id):
     account = _account_mgr.validate_account(acc_id)
     return jsonify({"ok":account.get("status")=="active","account":_safe_account(account)})
+
+@app.route("/api/v1/accounts/<acc_id>/mail-settings", methods=["POST"])
+@_require_api_key
+def api_v1_set_mail_settings(acc_id):
+    data = request.get_json() or {}
+    try:
+        account = _account_mgr.set_mail_settings(
+            acc_id,
+            data.get("email") or data.get("mail_email") or "",
+            data.get("password") or data.get("mail_password") or "",
+            data.get("host") or data.get("mail_host") or "",
+            data.get("port") or data.get("mail_port") or 993,
+        )
+        result = _account_mgr.test_mail_connection(acc_id)
+        return jsonify({"ok":bool(result.get("ok")),"account":_safe_account(account),"mail":result})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
 
 @app.route("/api/v1/accounts/<acc_id>/aliases", methods=["GET"])
 @_require_api_key
@@ -325,21 +432,99 @@ def api_v1_create_alias(acc_id):
 def api_v1_deactivate_alias(acc_id, anonymous_id):
     return jsonify({"ok":_account_mgr.deactivate_alias_for_account(acc_id, anonymous_id)})
 
+def _available_hme_item(item: dict, accounts: dict) -> dict:
+    account = accounts.get(item.get("account_id"), {})
+    return {
+        "hme": item.get("alias_email", ""),
+        "alias_email": item.get("alias_email", ""),
+        "account_id": item.get("account_id", ""),
+        "account_name": item.get("account_name", ""),
+        "label": item.get("label", ""),
+        "created_at": item.get("created_at", ""),
+        "is_active": bool(item.get("is_active")),
+        "can_read_mail": account.get("status") == "active",
+        "mail_status": "available" if account.get("status") == "active" else "unavailable",
+        "shared": item.get("shared"),
+    }
+
+def _available_hme_items(refresh: bool = False) -> list:
+    account_id = request.args.get("account_id", "") if request else ""
+    q = request.args.get("q", "") if request else ""
+    items = _mailbox_service.list_mailboxes(
+        q=q,
+        account_id=account_id,
+        status="active",
+        refresh=refresh,
+    )
+    accounts = {a.get("id"): a for a in _account_mgr.list_accounts()}
+    result = []
+    for item in items:
+        account = accounts.get(item.get("account_id"), {})
+        if account.get("status") != "active":
+            continue
+        result.append(_available_hme_item(item, accounts))
+    return result
+
+def _available_hme_payload(single: bool = False) -> dict:
+    refresh = request.args.get("refresh", "0") == "1"
+    include_latest = request.args.get("include_latest", "0") == "1"
+    force = request.args.get("force", "0") == "1"
+    items = _available_hme_items(refresh=refresh)
+    total = len(items)
+    page, limit, offset = _paginate(items, default_limit=25, max_limit=100)
+    if single:
+        page = page[:1]
+    if include_latest:
+        for item in page:
+            try:
+                item["latest_message"] = _mailbox_service.get_latest_message(item["alias_email"], force=force)
+            except (IMAPNotConfigured, IMAPUnavailable):
+                item["latest_message"] = None
+                item["mail_status"] = "not_ready"
+            except MailboxNotFound:
+                item["latest_message"] = None
+                item["mail_error"] = "mailbox not found"
+    payload = {"ok": True, "hme": page, "count": len(page), "total": total, "limit": limit, "offset": offset, "refreshed": refresh}
+    if single:
+        payload["item"] = page[0] if page else None
+    return payload
+
+@app.route("/api/v1/config")
+@_require_api_key
+def api_v1_config():
+    return jsonify(_api_config_payload())
+
+@app.route("/api/v1/client-config")
+@_require_api_key
+def api_v1_client_config():
+    return jsonify(_api_config_payload())
+
+@app.route("/api/v1/hme/available")
+@_require_api_key
+def api_v1_hme_available():
+    return jsonify(_available_hme_payload())
+
+@app.route("/api/v1/hme/available/next")
+@_require_api_key
+def api_v1_hme_available_next():
+    return jsonify(_available_hme_payload(single=True))
+
+@app.route("/api/v1/hme/<path:alias_email>/latest")
+@_require_api_key
+def api_v1_hme_latest(alias_email):
+    force = request.args.get("force", "0") == "1"
+    mailbox = _mailbox_service.get_mailbox(alias_email)
+    try:
+        message = _mailbox_service.get_latest_message(alias_email, force=force)
+    except (IMAPNotConfigured, IMAPUnavailable):
+        message = None
+    return jsonify({"ok":True,"hme":mailbox["alias_email"],"mailbox":mailbox,"message":message})
+
 @app.route("/api/v1/accounts/<acc_id>/aliases/<anonymous_id>", methods=["DELETE"])
 @_require_api_key
 def api_v1_delete_alias(acc_id, anonymous_id):
     return jsonify({"ok":_account_mgr.delete_alias_for_account(acc_id, anonymous_id)})
 
-@app.route("/api/v1/accounts/<acc_id>/imap", methods=["POST"])
-@_require_api_key
-def api_v1_set_imap(acc_id):
-    data = request.get_json() or {}
-    app_password = data.get("app_password", "").strip()
-    icloud_email = data.get("icloud_email", "").strip()
-    if not app_password or not icloud_email:
-        return jsonify({"ok":False,"error":"icloud_email and app_password are required"}), 400
-    _account_mgr.set_app_password(acc_id, app_password, icloud_email)
-    return jsonify(_account_mgr.test_imap_connection(acc_id))
 
 @app.route("/api/v1/accounts/<acc_id>/verification-codes")
 @_require_api_key
@@ -351,14 +536,16 @@ def api_v1_verification_codes(acc_id):
     return jsonify({"ok":True,"codes":codes,"count":len(codes),"alias":alias})
 
 def _mailbox_list_payload():
+    refresh = request.args.get("refresh", "0") == "1"
     items = _mailbox_service.list_mailboxes(
         q=request.args.get("q", ""),
         account_id=request.args.get("account_id", "") or request.args.get("account", ""),
         status=request.args.get("status", ""),
+        refresh=refresh,
     )
     total = len(items)
     page, limit, offset = _paginate(items)
-    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset}
+    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh}
 
 @app.route("/api/v1/mailboxes")
 @_require_api_key
@@ -396,7 +583,7 @@ def api_v1_shared_mailboxes_create():
     mailbox = _mailbox_service.get_mailbox(alias)
     created = _shared_store.create(mailbox["account_id"], mailbox["alias_email"])
     raw_key = created.pop("share_key")
-    return jsonify({"ok":True,"shared":created,"share_key":raw_key,"share_url":_share_url(raw_key)})
+    return jsonify(_share_create_payload(created, raw_key))
 
 @app.route("/api/v1/shared-mailboxes")
 @_require_api_key
@@ -433,7 +620,7 @@ def api_mailbox_share(alias_email):
     mailbox = _mailbox_service.get_mailbox(alias_email)
     created = _shared_store.create(mailbox["account_id"], mailbox["alias_email"])
     raw_key = created.pop("share_key")
-    return jsonify({"ok":True,"shared":created,"share_key":raw_key,"share_url":_share_url(raw_key)})
+    return jsonify(_share_create_payload(created, raw_key))
 
 @app.route("/api/shared")
 def api_shared_list():
@@ -445,15 +632,14 @@ def api_shared_revoke(share_id):
     ok = _shared_store.revoke(share_id)
     return jsonify({"ok":ok})
 
-@app.route("/api/shared/<path:shared_key>/latest")
-def api_shared_latest(shared_key):
+def _shared_latest_payload(shared_key: str, force: bool = False):
     share, error = _shared_record_for_key(shared_key)
     if error:
         return error
     try:
-        view = _mailbox_service.shared_public_view(share, force=False)
+        view = _mailbox_service.shared_public_view(share, force=force)
         return jsonify({"ok":True, **view})
-    except IMAPNotConfigured:
+    except (IMAPNotConfigured, IMAPUnavailable):
         return jsonify({
             "ok":True,
             "mailbox":share.get("alias_email", ""),
@@ -466,12 +652,43 @@ def api_shared_latest(shared_key):
     except MailboxNotFound:
         return _shared_not_found_response()
 
+def _shared_request_code():
+    data = request.get_json(silent=True) or {}
+    code = (
+        data.get("redemption_code")
+        or data.get("share_key")
+        or request.args.get("redemption_code", "")
+        or request.args.get("code", "")
+        or ""
+    )
+    return str(code).strip()
+
+def _shared_request_force():
+    data = request.get_json(silent=True) or {}
+    return bool(data.get("force")) or request.args.get("force", "0") == "1"
+
+@app.route("/api/shared/latest", methods=["GET", "POST"])
+def api_shared_latest_by_code():
+    return _shared_latest_payload(_shared_request_code(), force=_shared_request_force())
+
+@app.route("/api/shared/redeem", methods=["GET", "POST"])
+def api_shared_redeem():
+    return _shared_latest_payload(_shared_request_code(), force=_shared_request_force())
+
+@app.route("/api/shared/<path:shared_key>/latest")
+def api_shared_latest(shared_key):
+    return _shared_latest_payload(shared_key, force=request.args.get("force", "0") == "1")
+
+@app.route("/shared")
+def shared_entry_page():
+    return render_template("shared.html", shared_key="", invalid=False, shared_url=_shared_entry_url())
+
 @app.route("/shared/<path:shared_key>")
 def shared_page(shared_key):
     share = _shared_store.verify(shared_key)
     if not share:
-        return render_template("shared.html", shared_key="", invalid=True), 404
-    return render_template("shared.html", shared_key=shared_key, invalid=False)
+        return render_template("shared.html", shared_key="", invalid=True, shared_url=_shared_entry_url()), 404
+    return render_template("shared.html", shared_key=shared_key, invalid=False, shared_url=_shared_entry_url())
 
 @app.route("/api/state")
 def api_state():
@@ -488,9 +705,8 @@ def api_accounts():
     accounts = _account_mgr.list_accounts()
     safe = []
     for a in accounts:
-        ac = {k:v for k,v in a.items() if k!="cookies"}
+        ac = _safe_account(a)
         ac["has_cookies"] = bool(a.get("cookies"))
-        ac["has_app_password"] = bool(a.get("app_password"))
         safe.append(ac)
     return jsonify({"accounts":safe,"count":len(safe)})
 
@@ -518,6 +734,28 @@ def api_validate_account(acc_id):
         account = _account_mgr.validate_account(acc_id)
         return jsonify({"ok":True,"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0)})
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/accounts/<acc_id>/mail-settings", methods=["POST"])
+def api_set_mail_settings(acc_id):
+    data = request.get_json() or {}
+    try:
+        account = _account_mgr.set_mail_settings(
+            acc_id,
+            data.get("email") or data.get("mail_email") or "",
+            data.get("password") or data.get("mail_password") or "",
+            data.get("host") or data.get("mail_host") or "",
+            data.get("port") or data.get("mail_port") or 993,
+        )
+        result = _account_mgr.test_mail_connection(acc_id)
+        return jsonify({"ok":bool(result.get("ok")),"account":_safe_account(account),"mail":result})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
+
+
+@app.route("/api/mail-settings/defaults")
+def api_mail_settings_defaults():
+    email = request.args.get("email", "")
+    return jsonify({"ok":True,"host":infer_mail_host(email),"port":993})
 
 @app.route("/api/accounts/<acc_id>/create", methods=["POST"])
 def api_create_for_account(acc_id):
@@ -560,18 +798,6 @@ def api_create_batch():
         _update_state(creating=False)
         return jsonify({"ok":False,"error":str(e)})
 
-@app.route("/api/accounts/<acc_id>/app-password", methods=["POST"])
-def api_set_app_password(acc_id):
-    data = request.get_json() or {}
-    pwd = data.get("app_password","").strip()
-    icloud_email = data.get("icloud_email","").strip()
-    if not pwd: return jsonify({"ok":False,"error":"密码不能为空"})
-    try:
-        _account_mgr.set_app_password(acc_id, pwd)
-        if icloud_email: _account_mgr.update_account(acc_id, icloud_email=icloud_email)
-        result = _account_mgr.test_imap_connection(acc_id)
-        return jsonify(result)
-    except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/accounts/<acc_id>/inbox")
 def api_inbox(acc_id):
@@ -677,14 +903,27 @@ def api_emails():
     emails.reverse()
     return jsonify({"emails":emails,"count":len(emails)})
 
-@app.route("/api/scheduler/start", methods=["POST"])
-def api_scheduler_start():
+def _start_scheduler_thread() -> bool:
     global _scheduler_thread, _stop_event
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        _update_state(running=True)
+        return False
     _stop_event.clear()
     _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
     _scheduler_thread.start()
     _update_state(running=True)
-    return jsonify({"ok":True})
+    return True
+
+
+def _auto_start_scheduler_requested(args) -> bool:
+    value = os.environ.get("AUTO_START_SCHEDULER", "").strip().lower()
+    return bool(args.scheduler or value in ("1", "true", "yes", "on"))
+
+
+@app.route("/api/scheduler/start", methods=["POST"])
+def api_scheduler_start():
+    started = _start_scheduler_thread()
+    return jsonify({"ok":True,"started":started})
 
 @app.route("/api/scheduler/stop", methods=["POST"])
 def api_scheduler_stop():
@@ -716,13 +955,9 @@ def main():
         print(f"[+] {len(accounts)} account(s) loaded")
         for a in accounts: print(f"    [OK] {a.get('name','?')} - {a.get('real_email','?')} ({a.get('alias_total',0)} aliases)")
     else: print("[*] No accounts yet")
-    if args.scheduler:
-        global _scheduler_thread, _stop_event
-        _stop_event.clear()
-        _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
-        _scheduler_thread.start()
-        _update_state(running=True)
-        print("[+] Scheduler auto-started")
+    if _auto_start_scheduler_requested(args):
+        started = _start_scheduler_thread()
+        print("[+] Scheduler auto-started" if started else "[+] Scheduler already running")
     def _shutdown(sig,frame): print("\n[*] Shutting down..."); _stop_event.set(); os._exit(0)
     _signal.signal(_signal.SIGINT, _shutdown)
     _signal.signal(_signal.SIGTERM, _shutdown)

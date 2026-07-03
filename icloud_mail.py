@@ -2,7 +2,7 @@
 """
 iCloud Mail — IMAP 收件箱检查模块
 ===================================
-通过 Apple 应用专用密码连接 iCloud Mail IMAP，
+通过 iCloud Mail 认证凭据连接 IMAP，
 查询隐私邮箱别名收到的邮件。
 
 用法:
@@ -14,8 +14,8 @@ iCloud Mail — IMAP 收件箱检查模块
     alias_mail = mail.find_by_recipient("alias@icloud.com")
 
 前提:
-  - 需要在 appleid.apple.com 生成「App 专用密码」
-  - iCloud 邮箱已开启 IMAP 访问
+  - 需要可用于 iCloud Mail 的认证凭据
+  - iCloud 邮箱已开启邮件访问
 """
 
 import imaplib
@@ -39,31 +39,29 @@ CODE_PATTERNS = [
 class ICloudMail:
     """iCloud Mail IMAP 客户端"""
 
-    def __init__(self, apple_id: str, app_password: str, verbose: bool = False):
+    def __init__(self, apple_id: str, app_password: str, verbose: bool = False,
+                 server: str = IMAP_SERVER, port: int = IMAP_PORT):
         self.apple_id = apple_id
         self.app_password = app_password
+        self.server = server or IMAP_SERVER
+        self.port = int(port or IMAP_PORT)
         self.verbose = verbose
         self._conn: Optional[imaplib.IMAP4_SSL] = None
 
     def connect(self) -> bool:
         try:
-            self._conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=IMAP_TIMEOUT)
+            self._conn = imaplib.IMAP4_SSL(self.server, self.port, timeout=IMAP_TIMEOUT)
             self._conn.login(self.apple_id, self.app_password)
             if self.verbose:
-                print(f"[IMAP] Connected as {self.apple_id}")
+                print(f"[IMAP] Connected as {self.apple_id} via {self.server}:{self.port}")
             return True
         except imaplib.IMAP4.error as e:
-            msg = str(e)
-            if "authentication" in msg.lower() or "login" in msg.lower():
-                raise RuntimeError(
-                    f"IMAP 登录失败 — 请检查:\n"
-                    f"  1. 应用专用密码是否正确\n"
-                    f"  2. Apple ID: {self.apple_id}\n"
-                    f"  3. 是否已在 appleid.apple.com 生成密码"
-                )
-            raise RuntimeError(f"IMAP 连接失败: {msg}")
+            msg = str(e).lower()
+            if "authentication" in msg or "login" in msg or "password" in msg or "[auth" in msg:
+                raise RuntimeError("邮件登录认证失败，请更新邮件登录配置")
+            raise RuntimeError("邮件服务器连接失败，请检查 IMAP 服务器和端口")
         except Exception as e:
-            raise RuntimeError(f"IMAP 连接失败: {e}")
+            raise RuntimeError("邮件服务器连接失败，请检查 IMAP 服务器和端口") from e
 
     def disconnect(self):
         if self._conn:
@@ -331,7 +329,7 @@ class ICloudMail:
                 return {"ok": False, "error": "无法选中 INBOX"}
             msg_count = int(data[0]) if data else 0
             self.disconnect()
-            return {"ok": True, "email": self.apple_id, "inbox_count": msg_count}
+            return {"ok": True, "email": self.apple_id, "server": self.server, "port": self.port, "inbox_count": msg_count}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 

@@ -8,6 +8,7 @@
     timers: {},
     E(id){ return document.getElementById(id); },
     esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); },
+    inlineArg(value){ return S.esc(JSON.stringify(value)); },
     async api(path, opts){
       const res = await fetch(path, opts || {});
       const data = await res.json().catch(() => ({}));
@@ -76,6 +77,7 @@
     if (S.route.startsWith('#/batch')) return HME.renderBatch();
     if (S.route.startsWith('#/inbox')) return HME.renderInbox();
     if (S.route.startsWith('#/docs')) return HME.renderDocs();
+    if (S.route.startsWith('#/api-keys')) return HME.renderApiKeys();
     if (S.route.startsWith('#/logs')) return HME.renderLogs();
     return HME.renderDashboard();
   }

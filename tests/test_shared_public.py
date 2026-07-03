@@ -89,6 +89,27 @@ def test_public_shared_latest_is_whitelisted(monkeypatch, tmp_path):
         assert forbidden not in body
 
 
+def test_public_shared_main_entry_redeems_code(monkeypatch, tmp_path):
+    client, raw_key, _share_id = configure(monkeypatch, tmp_path)
+
+    page = client.get("/shared")
+    assert page.status_code == 200
+    page_body = page.get_data(as_text=True)
+    assert "共享邮箱主入口" in page_body
+    assert "提取邮箱" in page_body
+    assert "刷新邮件" in page_body
+    assert "redeemBtn.disabled = false" in page_body
+
+    redeemed = client.post("/api/shared/latest", json={"redemption_code": raw_key})
+    assert redeemed.status_code == 200
+    assert redeemed.json["mailbox"] == "alias@icloud.com"
+    assert redeemed.json["message"]["body"] == "safe public body"
+
+    refreshed = client.post("/api/shared/latest", json={"redemption_code": raw_key, "force": True})
+    assert refreshed.status_code == 200
+    assert refreshed.json["mailbox"] == "alias@icloud.com"
+
+
 def test_public_shared_revoked_and_invalid_are_same_404(monkeypatch, tmp_path):
     client, raw_key, share_id = configure(monkeypatch, tmp_path)
     invalid = client.get("/api/shared/shk_invalid/latest")

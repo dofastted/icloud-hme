@@ -11,8 +11,8 @@
       ['TODAY', st.today_created || 0, '']
     ].map(c => '<div class="card"><div class="label">' + c[0] + '</div><div class="value ' + c[2] + '">' + c[1] + '</div></div>').join('');
     const accountCards = S.accounts.map(a => {
-      const imap = a.has_app_password ? '<span class="badge ok">IMAP 已配置</span>' : '<span class="badge err">IMAP 未配置</span>';
-      return '<div class="card"><div class="label">' + S.esc(a.status || '') + '</div><h3 class="mono">' + S.esc(a.name || a.id) + '</h3><p class="muted mono">' + S.esc(a.real_email || '') + '</p><p>' + imap + '</p><p class="muted mono">aliases ' + (a.alias_total || 0) + ' / active ' + (a.alias_active || 0) + '</p><div class="btn-row"><button class="btn btn-outline btn-sm" onclick="HME.navigate(\'#/mailboxes?account=' + encodeURIComponent(a.id) + '\')">查看邮箱</button><button class="btn btn-outline btn-sm" onclick="HME.showAppPasswordModal(\'' + S.esc(a.id) + '\')">IMAP</button><button class="btn btn-outline btn-sm" onclick="HME.validateAccount(\'' + S.esc(a.id) + '\')">校验</button></div></div>';
+      const mailText = a.has_mail_config ? ('邮件登录 ' + (a.mail_host || '已配置')) : '邮件登录未配置';
+      return '<div class="card"><div class="label">' + S.esc(a.status || '') + '</div><h3 class="mono">' + S.esc(a.name || a.id) + '</h3><p class="muted mono">' + S.esc(a.real_email || '') + '</p><p class="muted mono">' + S.esc(mailText) + '</p><p class="muted mono">aliases ' + (a.alias_total || 0) + ' / active ' + (a.alias_active || 0) + '</p><div class="btn-row"><button class="btn btn-outline btn-sm" onclick="HME.navigate(\'#/mailboxes?account=' + encodeURIComponent(a.id) + '\')">查看邮箱</button><button class="btn btn-outline btn-sm" onclick="HME.showMailSettingsModal(' + S.inlineArg(a.id) + ')">邮件登录</button><button class="btn btn-outline btn-sm" onclick="HME.validateAccount(' + S.inlineArg(a.id) + ')">校验</button></div></div>';
     }).join('');
     S.view('<div class="grid cards">' + cards + '</div><div style="height:18px"></div><div class="grid cards">' + (accountCards || '<div class="card muted">暂无账号</div>') + '</div>');
   };
@@ -39,15 +39,23 @@
       S.refreshAll();
     } catch (err) { S.toast(err.message, true); }
   };
-  S.showAppPasswordModal = function(id){
-    const acc = S.accounts.find(a => a.id === id) || {};
-    S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 设置 IMAP</h3><p class="muted mono">' + S.esc(acc.name || id) + '</p><input id="icloudEmailInput" placeholder="xxx@icloud.com" value="' + S.esc(acc.icloud_email || '') + '"><input id="appPwdInput" type="password" placeholder="App 专用密码"><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button class="btn" onclick="HME.saveAppPassword(\'' + S.esc(id) + '\')">保存并测试</button></div><div id="modalMsg" class="warning"></div></div></div>';
+  S.showMailSettingsModal = function(id){
+    const account = S.accounts.find(a => a.id === id) || {};
+    const email = account.mail_email || account.real_email || '';
+    const host = account.mail_host || '';
+    const port = account.mail_port || 993;
+    S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 邮件登录</h3><p class="muted">HME 邮件会转发到接收邮箱。这里配置接收邮箱的 IMAP 登录，用于读取邮件内容。</p><label class="label">接收邮箱</label><input id="mailEmailInput" placeholder="name@example.com" value="' + S.esc(email) + '"><label class="label">IMAP 服务器</label><input id="mailHostInput" placeholder="imap.example.com" value="' + S.esc(host) + '"><label class="label">端口</label><input id="mailPortInput" placeholder="993" value="' + S.esc(port) + '"><label class="label">邮箱授权码或密码</label><input id="mailPasswordInput" type="password" autocomplete="new-password" placeholder="只保存到本机 accounts.json"><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button class="btn" onclick="HME.saveMailSettings(' + S.inlineArg(id) + ')">保存并测试</button></div><div id="modalMsg" class="warning"></div></div></div>';
   };
-  S.saveAppPassword = async function(id){
+  S.saveMailSettings = async function(id){
     try {
-      await S.api('/api/accounts/' + encodeURIComponent(id) + '/app-password', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({icloud_email:S.E('icloudEmailInput').value.trim(), app_password:S.E('appPwdInput').value.trim()})});
+      const email = S.E('mailEmailInput').value.trim();
+      const host = S.E('mailHostInput').value.trim();
+      const port = S.E('mailPortInput').value.trim() || '993';
+      const password = S.E('mailPasswordInput').value.trim();
+      const res = await S.api('/api/accounts/' + encodeURIComponent(id) + '/mail-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, host, port, password})});
+      if (!res.ok) throw new Error((res.mail && res.mail.error) || res.error || '邮件登录未通过');
       S.closeModal();
-      S.toast('IMAP 已保存');
+      S.toast('邮件登录已通过');
       S.refreshAll();
     } catch (err) { S.E('modalMsg').textContent = err.message; }
   };

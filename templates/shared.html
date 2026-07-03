@@ -8,14 +8,25 @@
 </head>
 <body>
   <main class="shared-shell">
-    <div class="shared-title"><span></span>SHARED MAILBOX</div>
+    <div class="shared-title"><span></span>SHARED MAILBOX ENTRY</div>
     <section class="shared-card">
       {% if invalid %}
       <h1>链接不存在或已失效</h1>
       <p class="muted">该共享链接不可用。</p>
+      <a class="entry-link" href="/shared">返回共享主入口</a>
       {% else %}
-      <h1 id="mailboxTitle">读取中...</h1>
-      <div id="stateBox" class="state">读取中...</div>
+      <h1 id="mailboxTitle">共享邮箱主入口</h1>
+      <p class="muted">输入独立 HME 兑换码，提取邮箱并读取最新一封邮件。</p>
+      <div class="redeem-box">
+        <label class="label" for="codeInput">兑换码</label>
+        <input id="codeInput" autocomplete="one-time-code" spellcheck="false" value="{{ shared_key }}" placeholder="shk_xxx">
+        <div class="button-row">
+          <button id="redeemBtn">提取邮箱</button>
+          <button id="refreshBtn" class="secondary" disabled>刷新邮件</button>
+        </div>
+      </div>
+      <div id="codeEcho" class="code-echo" hidden></div>
+      <div id="stateBox" class="state">请输入兑换码。</div>
       <article id="messageCard" class="message" hidden>
         <div class="label">最新一封邮件</div>
         <h2 id="msgSubject"></h2>
@@ -23,33 +34,57 @@
         <pre id="msgBody"></pre>
       </article>
       <div class="footer-row">
-        <button id="refreshBtn">刷新</button>
         <span id="cacheInfo"></span>
+        <span class="muted">只读共享视图 · 仅展示最新一封邮件</span>
       </div>
-      <p class="muted">只读共享视图 · 仅展示最新一封邮件</p>
       {% endif %}
     </section>
   </main>
   {% if not invalid %}
   <script>
   (function(){
-    const key = {{ shared_key|tojson }};
+    const initialCode = {{ shared_key|tojson }};
+    const codeInput = document.getElementById('codeInput');
+    const codeEcho = document.getElementById('codeEcho');
     const box = document.getElementById('stateBox');
     const card = document.getElementById('messageCard');
-    const btn = document.getElementById('refreshBtn');
+    const redeemBtn = document.getElementById('redeemBtn');
+    const refreshBtn = document.getElementById('refreshBtn');
+    let loadSeq = 0;
     function setText(id, text){ document.getElementById(id).textContent = text || ''; }
-    async function load(){
-      btn.disabled = true;
+    function currentCode(){ return codeInput.value.trim(); }
+    function setBusy(busy){ redeemBtn.disabled = busy; refreshBtn.disabled = busy || !currentCode(); }
+    async function load(force){
+      const seq = ++loadSeq;
+      const code = currentCode();
+      if (!code) {
+        box.hidden = false;
+        box.textContent = '请输入兑换码。';
+        card.hidden = true;
+        codeEcho.hidden = true;
+        refreshBtn.disabled = true;
+        return;
+      }
+      setBusy(true);
       box.hidden = false;
-      box.textContent = '读取中...';
+      box.textContent = force ? '正在刷新邮件...' : '正在提取邮箱...';
       card.hidden = true;
       try {
-        const res = await fetch('/api/shared/' + encodeURIComponent(key) + '/latest');
+        const res = await fetch('/api/shared/latest', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({redemption_code: code, force: !!force})
+        });
         const data = await res.json().catch(() => ({}));
-        if (res.status === 404) throw new Error('链接不存在或已失效');
+        if (seq !== loadSeq) return;
+        if (res.status === 404) throw new Error('兑换码不存在或已失效');
         if (res.status === 429) throw new Error('访问过于频繁，请稍后再试');
         if (!res.ok || data.ok === false) throw new Error(data.error || '读取失败');
+        localStorage.setItem('hme_shared_redemption_code', code);
+        codeEcho.hidden = false;
+        codeEcho.textContent = '兑换码：' + code;
         setText('mailboxTitle', data.mailbox || 'Shared Mailbox');
+        refreshBtn.disabled = false;
         if (!data.message) {
           box.textContent = data.note || '该邮箱暂无邮件，稍后刷新查看';
           return;
@@ -61,13 +96,28 @@
         setText('msgBody', data.message.body || '(无正文)');
         setText('cacheInfo', 'fetched ' + (data.fetched_at || '') + (data.cache_age_sec == null ? '' : ' · cache ' + Math.round(data.cache_age_sec) + 's'));
       } catch (err) {
+        if (seq !== loadSeq) return;
         box.textContent = err.message || '读取失败';
+        refreshBtn.disabled = true;
       } finally {
-        setTimeout(() => { btn.disabled = false; }, 3000);
+        setTimeout(() => { if (seq === loadSeq) setBusy(false); }, 600);
       }
     }
-    btn.addEventListener('click', load);
-    load();
+    redeemBtn.addEventListener('click', () => load(false));
+    refreshBtn.addEventListener('click', () => load(true));
+    codeInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') load(false);
+    });
+    codeInput.addEventListener('input', () => {
+      loadSeq += 1;
+      redeemBtn.disabled = false;
+      refreshBtn.disabled = !currentCode();
+    });
+    if (!initialCode) {
+      const saved = localStorage.getItem('hme_shared_redemption_code') || '';
+      if (saved) codeInput.value = saved;
+    }
+    if (currentCode()) load(false);
   })();
   </script>
   {% endif %}

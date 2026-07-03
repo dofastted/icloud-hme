@@ -19,6 +19,7 @@ iCloud HME — 多账号管理器
     mgr.create_aliases_batch(["acc_xxx", "acc_yyy"], count_per_account=5)
 """
 
+import os
 import json
 import time
 import uuid
@@ -32,6 +33,60 @@ ACCOUNTS_FILE = HERE / "accounts.json"
 OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
+SCHEDULER_ALIAS_LIMIT = int(os.environ.get("HME_SCHEDULER_ALIAS_LIMIT", "750"))
+MAIL_PROVIDER_HOSTS = {
+    "icloud.com": "imap.mail.me.com",
+    "me.com": "imap.mail.me.com",
+    "mac.com": "imap.mail.me.com",
+    "qq.com": "imap.qq.com",
+    "vip.qq.com": "imap.qq.com",
+    "163.com": "imap.163.com",
+    "126.com": "imap.126.com",
+    "yeah.net": "imap.yeah.net",
+    "gmail.com": "imap.gmail.com",
+    "outlook.com": "imap-mail.outlook.com",
+    "hotmail.com": "imap-mail.outlook.com",
+    "live.com": "imap-mail.outlook.com",
+}
+
+
+def infer_mail_host(email: str) -> str:
+    domain = str(email or "").strip().lower().rsplit("@", 1)[-1]
+    return MAIL_PROVIDER_HOSTS.get(domain, "")
+
+
+def account_mail_email(account: Dict) -> str:
+    return (
+        str(account.get("mail_email") or "").strip()
+        or str(account.get("real_email") or "").strip()
+        or str(account.get("icloud_email") or "").strip()
+    )
+
+
+def account_mail_host(account: Dict) -> str:
+    return str(account.get("mail_host") or "").strip() or infer_mail_host(account_mail_email(account))
+
+
+def account_has_mail_config(account: Dict) -> bool:
+    return bool(account_mail_email(account) and account_mail_host(account) and (account.get("mail_password") or account.get("app_password")))
+
+
+def account_alias_total(account: Dict) -> int:
+    try:
+        return int(account.get("alias_total") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def account_reached_scheduler_limit(account: Dict, limit: int = SCHEDULER_ALIAS_LIMIT) -> bool:
+    return account_alias_total(account) >= limit
+
+
+def scheduler_eligible_accounts(accounts: List[Dict], limit: int = SCHEDULER_ALIAS_LIMIT) -> List[Dict]:
+    return [
+        account for account in accounts
+        if account.get("status") == "active" and not account_reached_scheduler_limit(account, limit)
+    ]
 
 from mail_cache import get_cache  # noqa: E402
 
@@ -300,15 +355,6 @@ class AccountManager:
             verbose=verbose,
         )
 
-    def set_app_password(self, acc_id: str, app_password: str,
-                         icloud_email: str = ""):
-        with self._lock:
-            if acc_id not in self.accounts:
-                raise KeyError(f"账号不存在: {acc_id}")
-            self.accounts[acc_id]["app_password"] = app_password
-            if icloud_email:
-                self.accounts[acc_id]["icloud_email"] = icloud_email
-            self._save()
 
     def get_mail_client(self, acc_id: str, verbose: bool = False):
         from icloud_mail import ICloudMail
@@ -316,26 +362,44 @@ class AccountManager:
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
-        app_pwd = account.get("app_password", "")
-        imap_email = account.get("icloud_email", "")
-        if not imap_email:
-            real = account.get("real_email", "")
-            if real and any(d in real for d in ("@icloud.com", "@me.com", "@mac.com")):
-                imap_email = real
-            else:
-                raise ValueError(
-                    "未设置 iCloud 邮箱。\n"
-                    "Apple ID ({}) 不是 iCloud 地址，\n"
-                    "请点击下方按钮输入你的 @icloud.com 邮箱".format(
-                        account.get("real_email", "?")
-                    )
-                )
-        if not app_pwd:
-            raise ValueError(
-                "未设置 App 专用密码。\n"
-                "请点击下方按钮，输入 @icloud.com 邮箱和应用密码"
-            )
-        return ICloudMail(imap_email, app_pwd, verbose=verbose)
+        mail_email = account_mail_email(account)
+        mail_host = account_mail_host(account)
+        mail_port = int(account.get("mail_port") or 993)
+        mail_password = account.get("mail_password") or account.get("app_password", "")
+        if not mail_email or not mail_host or not mail_password:
+            raise ValueError("邮件读取未配置，请在账号卡片中设置邮件登录")
+        return ICloudMail(mail_email, mail_password, verbose=verbose, server=mail_host, port=mail_port)
+
+    def set_mail_settings(self, acc_id: str, email: str, password: str,
+                          host: str = "", port: int = 993) -> Dict:
+        email = str(email or "").strip()
+        password = str(password or "").strip()
+        host = str(host or "").strip() or infer_mail_host(email)
+        port = int(port or 993)
+        if not email:
+            raise ValueError("请填写邮件登录邮箱")
+        if not password:
+            raise ValueError("请填写邮箱授权码或密码")
+        if not host:
+            raise ValueError("请填写 IMAP 服务器")
+        with self._lock:
+            if acc_id not in self.accounts:
+                raise KeyError(f"账号不存在: {acc_id}")
+            self.accounts[acc_id].update({
+                "mail_email": email,
+                "mail_password": password,
+                "mail_host": host,
+                "mail_port": port,
+            })
+            self._save()
+            return dict(self.accounts[acc_id])
+
+    def test_mail_connection(self, acc_id: str) -> Dict:
+        mail = self.get_mail_client(acc_id)
+        result = mail.test_connection()
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "邮件读取暂不可用"}
+        return result
 
     def check_inbox(self, acc_id: str, limit: int = 50, days: int = 7,
                     force: bool = False) -> List[Dict]:
@@ -425,14 +489,6 @@ class AccountManager:
 
         return results
 
-    def test_imap_connection(self, acc_id: str) -> Dict:
-        try:
-            mail = self.get_mail_client(acc_id)
-            result = mail.test_connection()
-            mail.disconnect()
-            return result
-        except Exception as e:
-            return {"ok": False, "error": str(e)[:200]}
 
     def get_verification_codes(self, acc_id: str, alias_email: str = "",
                                limit: int = 10, days: int = 1) -> List[Dict]:
@@ -617,13 +673,13 @@ if __name__ == "__main__":
     mgr = AccountManager()
     summary = mgr.get_summary()
     print(f"当前账号数: {summary['account_count']}")
-    
+
     header = "X_APPLE_WEB_KB=abc123; SESSION_TOKEN=xyz789"
     parsed = mgr.parse_cookie_input(header)
     print(f"Header String → {len(parsed)} 个 cookie")
-    
+
     json_in = '{"X_APPLE_WEB_KB":"abc123","SESSION_TOKEN":"xyz789"}'
     parsed2 = mgr.parse_cookie_input(json_in)
     print(f"JSON → {len(parsed2)} 个 cookie")
-    
+
     print("自测完成 ✓")

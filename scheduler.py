@@ -21,7 +21,7 @@ from typing import Optional, Dict, List
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
-from account_manager import AccountManager
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts
 
 LOG_DIR = HERE / "logs"
 RESULT_DIR = HERE / "results"
@@ -59,19 +59,41 @@ LIMIT_KEYWORDS = ["limit","exceeded","maximum","too many","quota","cannot create
 def is_limit_error(error: str) -> bool:
     return any(kw in error.lower() for kw in LIMIT_KEYWORDS)
 
+
+def refresh_scheduler_account_count(mgr: AccountManager, account: Dict, logger: logging.Logger) -> Dict:
+    acc_id = account["id"]
+    try:
+        aliases = mgr.get_aliases_for_account(acc_id)
+    except Exception as exc:
+        logger.warning(f"[{account.get('name', acc_id)}] refresh alias count failed: {str(exc)[:80]}")
+        return account
+    alias_total = len(aliases)
+    alias_active = sum(1 for alias in aliases if alias.get("active") or alias.get("isActive"))
+    updated = mgr.update_account(acc_id, alias_total=alias_total, alias_active=alias_active, last_error=None)
+    if updated:
+        account.update(updated)
+    return account
+
 def run_one_round(mgr: AccountManager, logger: logging.Logger, label: str = "", interval_sec: float = 3.0) -> CreateRound:
     import random as _random
     round_result = CreateRound()
     accounts = mgr.list_accounts()
-    active_accounts = [a for a in accounts if a.get("status") == "active"]
-    if not active_accounts: logger.warning("no active accounts"); round_result.end_time = datetime.now(); return round_result
-    logger.info(f"new round ({len(active_accounts)} accounts, 3-5 random/account)")
+    active_accounts = scheduler_eligible_accounts(accounts)
+    skipped = len([a for a in accounts if a.get("status") == "active" and account_reached_scheduler_limit(a)])
+    if not active_accounts:
+        logger.warning(f"no schedulable accounts (limit {SCHEDULER_ALIAS_LIMIT}/account)")
+        round_result.end_time = datetime.now()
+        return round_result
+    logger.info(f"new round ({len(active_accounts)} accounts, skipped {skipped} at limit, 3-5 random/account)")
     for i, account in enumerate(active_accounts):
         acc_id = account["id"]; acc_name = account.get("name", acc_id)
-        target_count = _random.randint(3, 5)
-        logger.info(f"[{i+1}/{len(active_accounts)}] {acc_name} target {target_count}")
-        try: mgr.get_aliases_for_account(acc_id); time.sleep(_random.uniform(2,5))
-        except: pass
+        account = refresh_scheduler_account_count(mgr, account, logger)
+        if account_reached_scheduler_limit(account):
+            logger.info(f"[{i+1}/{len(active_accounts)}] {acc_name} skipped: {account_alias_total(account)}/{SCHEDULER_ALIAS_LIMIT} aliases")
+            continue
+        remaining = SCHEDULER_ALIAS_LIMIT - account_alias_total(account)
+        target_count = min(_random.randint(3, 5), remaining)
+        logger.info(f"[{i+1}/{len(active_accounts)}] {acc_name} target {target_count}, current {account_alias_total(account)}/{SCHEDULER_ALIAS_LIMIT}")
         created = 0; errors = 0
         while created < target_count and errors < 3:
             try:
@@ -120,7 +142,7 @@ class Scheduler:
     def run(self):
         summary = self.mgr.get_summary()
         self.logger.info(f"scheduler started: {summary['account_count']} accounts ({summary['active_accounts']} active)")
-        self.logger.info(f"mode: BJ 7-20h, 60-90min interval, 3-5/account")
+        self.logger.info(f"mode: BJ 7-20h, 60-90min interval, 3-5/account, skip >= {SCHEDULER_ALIAS_LIMIT}/account")
         round_num = 0
         while self._running:
             round_num += 1; now = datetime.now()

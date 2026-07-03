@@ -18,8 +18,8 @@
 
   S.renderInbox = function(){
     S.setTitle('收件箱');
-    const options = '<option value="">选择账号</option>' + S.accounts.map(a => '<option value="' + S.esc(a.id) + '">' + S.esc(a.name || a.id) + (a.has_app_password ? ' [已设]' : ' [未设]') + '</option>').join('');
-    S.view('<div class="panel"><div class="panel-head">收件箱</div><div class="panel-body"><select id="inboxAccount">' + options + '</select> <input id="inboxAlias" placeholder="可选：指定 alias@icloud.com"> <button class="btn btn-outline btn-sm" onclick="HME.loadInbox()">读取</button> <button class="btn btn-outline btn-sm" onclick="HME.showAppPasswordModal(HME.E(\'inboxAccount\').value)">设置 IMAP</button><div id="inboxResult" style="margin-top:16px">' + S.empty('请选择账号后读取') + '</div></div></div>');
+    const options = '<option value="">选择账号</option>' + S.accounts.map(a => '<option value="' + S.esc(a.id) + '">' + S.esc(a.name || a.id) + '</option>').join('');
+    S.view('<div class="panel"><div class="panel-head">收件箱</div><div class="panel-body"><select id="inboxAccount">' + options + '</select> <input id="inboxAlias" placeholder="可选：指定 alias@icloud.com"> <button class="btn btn-outline btn-sm" onclick="HME.loadInbox()">读取</button><div id="inboxResult" style="margin-top:16px">' + S.empty('请选择账号后读取') + '</div></div></div>');
   };
   S.loadInbox = async function(){
     const acc = S.E('inboxAccount').value;
@@ -30,7 +30,7 @@
       const path = alias ? '/api/accounts/' + encodeURIComponent(acc) + '/mail/' + encodeURIComponent(alias) + '?limit=20' : '/api/accounts/' + encodeURIComponent(acc) + '/inbox?limit=20';
       const data = await S.api(path);
       const msgs = data.emails || [];
-      if (!msgs.length) { S.E('inboxResult').innerHTML = S.empty('暂无邮件'); return; }
+      if (!msgs.length) { S.E('inboxResult').innerHTML = S.empty(data.error || '暂无邮件'); return; }
       S.E('inboxResult').innerHTML = '<table class="table"><tbody>' + msgs.map(m => '<tr><td><strong>' + S.esc(m.subject || '(无主题)') + '</strong><br><span class="muted">' + S.esc(m.from || '') + '</span></td><td>' + S.esc(m.date || '') + '</td></tr>').join('') + '</tbody></table>';
     } catch (err) { S.E('inboxResult').innerHTML = S.error(err); }
   };
@@ -41,24 +41,26 @@
       ['管理端 API（本地 UI，无 API Key）', [
         ['GET','/api/mailboxes','邮箱列表，支持 q/account_id/status'],
         ['GET','/api/mailboxes/{alias}/messages','指定邮箱邮件，默认最新一封'],
-        ['POST','/api/mailboxes/{alias}/share','生成 shared 链接，明文仅返回一次'],
+        ['POST','/api/mailboxes/{alias}/share','生成兑换码，明文仅返回一次'],
         ['GET','/api/shared','共享列表'],
-        ['POST','/api/shared/{id}/revoke','吊销共享']
+        ['POST','/api/shared/{id}/revoke','吊销兑换码']
       ]],
       ['外部 v1 API（必须 API Key）', [
-        ['GET','/api/v1/mailboxes','邮箱列表'],
-        ['GET','/api/v1/mailboxes/search?q=xxx','邮箱搜索'],
-        ['GET','/api/v1/mailboxes/{alias}/messages','邮箱邮件'],
-        ['POST','/api/v1/shared-mailboxes','创建共享，body: {"alias_email":"..."}'],
-        ['POST','/api/v1/shared-mailboxes/{id}/revoke','吊销共享']
+        ['UI','#/api-keys','创建、保存、查看、吊销 API Key'],
+        ['GET','/api/v1/config','主配置入口'],
+        ['GET','/api/v1/hme/available','全局可用 HME'],
+        ['GET','/api/v1/hme/available/next','取一个可用 HME'],
+        ['GET','/api/v1/hme/{alias}/latest','读取指定 HME 最新邮件'],
+        ['POST','/api/v1/shared-mailboxes','创建兑换码，body: {"alias_email":"..."}'],
+        ['POST','/api/v1/shared-mailboxes/{id}/revoke','吊销兑换码']
       ]],
-      ['公网 shared（仅 key）', [
-        ['GET','/shared/{key}','只读页面'],
-        ['GET','/api/shared/{key}/latest','只返回最新一封，限流，脱敏']
+      ['公网 shared（仅兑换码）', [
+        ['GET','/shared','共享主入口'],
+        ['POST','/api/shared/latest','按兑换码只返回最新一封，限流，脱敏']
       ]]
     ];
     const html = sections.map(sec => '<div class="panel"><div class="panel-head">' + S.esc(sec[0]) + '</div><div class="panel-body">' + sec[1].map(i => '<p><span class="badge ok">' + i[0] + '</span> <code>' + S.esc(i[1]) + '</code><br><span class="muted">' + S.esc(i[2]) + '</span></p>').join('') + '</div></div>').join('');
-    S.view('<p class="muted">管理端口不应直接暴露公网；外部自动化请使用 API Key；shared 链接的 key 是唯一鉴权凭据。</p>' + html);
+    S.view('<p class="muted">管理端口不应直接暴露公网；外部自动化请使用 API Key；shared 入口使用兑换码。</p>' + html);
   };
 
   S.renderLogs = function(){
