@@ -21,7 +21,7 @@ class MailCache:
     """邮件本地缓存"""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._data: Dict = {}
         self._load()
 

@@ -3,13 +3,15 @@
 import sys, os, json, time, queue, secrets, threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from functools import wraps
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
-from flask import Flask, Response, request, jsonify, render_template_string
+from flask import Flask, Response, request, jsonify, render_template_string, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
+from api_keys import APIKeyStore, extract_api_key
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
@@ -25,10 +27,49 @@ _lock = threading.Lock()
 _scheduler_thread = None
 _stop_event = threading.Event()
 _account_mgr = AccountManager()
+_api_keys = APIKeyStore()
+
+@app.errorhandler(KeyError)
+def _handle_key_error(err):
+    return jsonify({"ok":False,"error":str(err).strip("'")}), 404
+
+@app.errorhandler(ValueError)
+def _handle_value_error(err):
+    return jsonify({"ok":False,"error":str(err)}), 400
+
+@app.errorhandler(RuntimeError)
+def _handle_runtime_error(err):
+    return jsonify({"ok":False,"error":str(err)}), 502
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
 def _is_limit_error(err: str) -> bool: return any(kw in err.lower() for kw in _RATE_LIMIT_KW)
+
+def _require_api_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = extract_api_key(request.headers)
+        record = _api_keys.verify(key)
+        if not record:
+            return jsonify({"ok":False,"error":"invalid API key"}), 401
+        g.api_key = record
+        return fn(*args, **kwargs)
+    return wrapper
+
+def _safe_account(account):
+    return {k:v for k,v in account.items() if k not in ("cookies","app_password")}
+
+def _alias_contract(alias):
+    return {
+        "hme": alias.get("hme") or alias.get("email") or "",
+        "label": alias.get("label", ""),
+        "note": alias.get("note", ""),
+        "isActive": bool(alias.get("isActive", alias.get("active", True))),
+        "createTimestamp": alias.get("createTimestamp") or alias.get("createdAt"),
+        "anonymousId": alias.get("anonymousId", ""),
+        "forwardToEmail": alias.get("forwardToEmail", ""),
+        "origin": alias.get("origin", ""),
+    }
 
 _time_offset = 0.0
 def _sync_time():
@@ -126,8 +167,129 @@ UI_HTML = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><met
 
 # ----- Flask Routes -----
 
-@app.route("/") @app.route("/index.html")
+@app.route("/")
+@app.route("/index.html")
 def index(): return render_template_string(UI_HTML)
+
+@app.route("/api/keys", methods=["POST"])
+def api_keys_create():
+    if _api_keys.has_keys() and not _api_keys.verify(extract_api_key(request.headers)):
+        return jsonify({"ok":False,"error":"invalid API key"}), 401
+    data = request.get_json() or {}
+    key = _api_keys.create(data.get("name", "default"))
+    return jsonify({"ok":True,"key":key})
+
+@app.route("/api/keys")
+@_require_api_key
+def api_keys_list():
+    return jsonify({"ok":True,"keys":_api_keys.list()})
+
+@app.route("/api/keys/<key_id>/revoke", methods=["POST"])
+@_require_api_key
+def api_keys_revoke(key_id):
+    return jsonify({"ok":_api_keys.deactivate(key_id)})
+
+@app.route("/api/v1/accounts", methods=["GET"])
+@_require_api_key
+def api_v1_accounts():
+    accounts = []
+    for account in _account_mgr.list_accounts():
+        item = _safe_account(account)
+        item["has_cookies"] = bool(account.get("cookies"))
+        item["has_app_password"] = bool(account.get("app_password"))
+        accounts.append(item)
+    return jsonify({"ok":True,"accounts":accounts,"count":len(accounts)})
+
+@app.route("/api/v1/accounts", methods=["POST"])
+@_require_api_key
+def api_v1_add_account():
+    data = request.get_json() or {}
+    cookie_input = data.get("cookie_input", "")
+    if not cookie_input:
+        return jsonify({"ok":False,"error":"cookie_input is required"}), 400
+    account = _account_mgr.add_account(
+        data.get("name", "未命名账号"),
+        cookie_input,
+        data.get("host", "icloud.com"),
+    )
+    return jsonify({"ok":True,"account":_safe_account(account)})
+
+@app.route("/api/v1/accounts/<acc_id>/session/validate", methods=["POST"])
+@_require_api_key
+def api_v1_validate_session(acc_id):
+    account = _account_mgr.validate_account(acc_id)
+    return jsonify({"ok":account.get("status")=="active","account":_safe_account(account)})
+
+@app.route("/api/v1/accounts/<acc_id>/aliases", methods=["GET"])
+@_require_api_key
+def api_v1_aliases(acc_id):
+    aliases = [_alias_contract(a) for a in _account_mgr.get_aliases_for_account(acc_id)]
+    return jsonify({"ok":True,"aliases":aliases,"count":len(aliases)})
+
+@app.route("/api/v1/accounts/<acc_id>/hme/generate", methods=["POST"])
+@_require_api_key
+def api_v1_generate_alias(acc_id):
+    result = _account_mgr.generate_alias_candidate(acc_id)
+    return jsonify({"ok":True,"result":result})
+
+@app.route("/api/v1/accounts/<acc_id>/hme/reserve", methods=["POST"])
+@_require_api_key
+def api_v1_reserve_alias(acc_id):
+    data = request.get_json() or {}
+    hme = data.get("hme", "")
+    if not hme:
+        return jsonify({"ok":False,"error":"hme is required"}), 400
+    alias = _account_mgr.reserve_alias_for_account(
+        acc_id,
+        hme,
+        data.get("label", ""),
+        data.get("note", ""),
+    )
+    return jsonify({"ok":True,"alias":_alias_contract(alias)})
+
+@app.route("/api/v1/accounts/<acc_id>/aliases", methods=["POST"])
+@_require_api_key
+def api_v1_create_alias(acc_id):
+    data = request.get_json() or {}
+    results = _account_mgr.create_aliases_for_account(
+        acc_id,
+        min(int(data.get("count", 1)), 50),
+        data.get("label", ""),
+        data.get("note", ""),
+    )
+    aliases = [_alias_contract(r) for r in results if r.get("ok")]
+    errors = [r.get("error") for r in results if not r.get("ok")]
+    return jsonify({"ok":bool(aliases),"aliases":aliases,"count":len(aliases),"errors":errors})
+
+@app.route("/api/v1/accounts/<acc_id>/aliases/<anonymous_id>/deactivate", methods=["POST"])
+@_require_api_key
+def api_v1_deactivate_alias(acc_id, anonymous_id):
+    return jsonify({"ok":_account_mgr.deactivate_alias_for_account(acc_id, anonymous_id)})
+
+@app.route("/api/v1/accounts/<acc_id>/aliases/<anonymous_id>", methods=["DELETE"])
+@_require_api_key
+def api_v1_delete_alias(acc_id, anonymous_id):
+    return jsonify({"ok":_account_mgr.delete_alias_for_account(acc_id, anonymous_id)})
+
+@app.route("/api/v1/accounts/<acc_id>/imap", methods=["POST"])
+@_require_api_key
+def api_v1_set_imap(acc_id):
+    data = request.get_json() or {}
+    app_password = data.get("app_password", "").strip()
+    icloud_email = data.get("icloud_email", "").strip()
+    if not app_password or not icloud_email:
+        return jsonify({"ok":False,"error":"icloud_email and app_password are required"}), 400
+    _account_mgr.set_app_password(acc_id, app_password, icloud_email)
+    return jsonify(_account_mgr.test_imap_connection(acc_id))
+
+@app.route("/api/v1/accounts/<acc_id>/verification-codes")
+@_require_api_key
+def api_v1_verification_codes(acc_id):
+    alias = request.args.get("alias", "").strip()
+    limit = min(request.args.get("limit", 10, type=int), 50)
+    days = min(request.args.get("days", 1, type=int), 30)
+    codes = _account_mgr.get_verification_codes(acc_id, alias, limit=limit, days=days)
+    return jsonify({"ok":True,"codes":codes,"count":len(codes),"alias":alias})
 
 @app.route("/api/state")
 def api_state():

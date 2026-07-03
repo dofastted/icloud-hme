@@ -41,7 +41,7 @@ class AccountManager:
 
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._cache = get_cache()
         self._load()
 
@@ -300,11 +300,14 @@ class AccountManager:
             verbose=verbose,
         )
 
-    def set_app_password(self, acc_id: str, app_password: str):
+    def set_app_password(self, acc_id: str, app_password: str,
+                         icloud_email: str = ""):
         with self._lock:
             if acc_id not in self.accounts:
                 raise KeyError(f"账号不存在: {acc_id}")
             self.accounts[acc_id]["app_password"] = app_password
+            if icloud_email:
+                self.accounts[acc_id]["icloud_email"] = icloud_email
             self._save()
 
     def get_mail_client(self, acc_id: str, verbose: bool = False):
@@ -431,8 +434,53 @@ class AccountManager:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
+    def get_verification_codes(self, acc_id: str, alias_email: str = "",
+                               limit: int = 10, days: int = 1) -> List[Dict]:
+        mail = self.get_mail_client(acc_id)
+        try:
+            return mail.find_verification_codes(alias_email, limit=limit, days=days)
+        finally:
+            mail.disconnect()
+
+    def generate_alias_candidate(self, acc_id: str) -> Dict:
+        client = self.get_client(acc_id, verbose=False)
+        return client.generate_alias()
+
+    def reserve_alias_for_account(self, acc_id: str, hme: str,
+                                  label: str = "", note: str = "") -> Dict:
+        client = self.get_client(acc_id, verbose=False)
+        alias = client.reserve_alias(hme, label or None, note)
+        self._refresh_alias_counts(acc_id, client)
+        return alias
+
+    def deactivate_alias_for_account(self, acc_id: str, anonymous_id: str) -> bool:
+        client = self.get_client(acc_id, verbose=False)
+        ok = client.deactivate(anonymous_id)
+        self._refresh_alias_counts(acc_id, client)
+        return ok
+
+    def delete_alias_for_account(self, acc_id: str, anonymous_id: str) -> bool:
+        client = self.get_client(acc_id, verbose=False)
+        ok = client.delete(anonymous_id)
+        self._refresh_alias_counts(acc_id, client)
+        return ok
+
+    def _refresh_alias_counts(self, acc_id: str, client=None):
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        if client is None:
+            client = self.get_client(acc_id, verbose=False)
+        aliases = client.list_aliases()
+        account["alias_total"] = len(aliases)
+        account["alias_active"] = sum(1 for a in aliases if a.get("active"))
+        account["last_validated"] = datetime.now().isoformat()
+        account["last_error"] = None
+        self._save()
+
     def create_aliases_for_account(
-        self, acc_id: str, count: int = 1, label: str = ""
+        self, acc_id: str, count: int = 1, label: str = "",
+        note: str = ""
     ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
@@ -453,14 +501,16 @@ class AccountManager:
                     f"{account.get('name', acc_id)} "
                     f"{datetime.now().strftime('%m%d%H%M')}-{i + 1}"
                 )
-                result = client.create_alias(label=alias_label, max_retries=3)
-                email = result.get("email", "")
+                result = client.create_alias(
+                    label=alias_label,
+                    note=note or None,
+                    max_retries=3,
+                )
+                email = result.get("hme") or result.get("email", "")
                 if email:
-                    results.append({
-                        "email": email,
-                        "account_id": acc_id,
-                        "ok": True,
-                    })
+                    item = dict(result)
+                    item.update({"email": email, "account_id": acc_id, "ok": True})
+                    results.append(item)
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
                         f.write(f"{email}\t{acc_id}\n")

@@ -51,10 +51,11 @@ import requests
 # 常量
 # ============================================================
 
-CLIENT_BUILD_NUMBER = "2206Hotfix11"
+CLIENT_BUILD_NUMBER = "2608Build39"
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 2.5, 5]
+DEFAULT_HME_LANG = "en-us"
 
 ICLOUD_COOKIE_DOMAINS = [
     ".icloud.com", ".icloud.com.cn",
@@ -230,7 +231,8 @@ class ICloudHME:
         self._setup_url: Optional[str] = None
         self._service_url: Optional[str] = None
         self._account_info: Optional[Dict] = None
-
+        self._client_id = self._generate_client_id()
+        self._dsid = self._extract_dsid(cookies)
     # ---- 内部 ----
 
     @staticmethod
@@ -241,6 +243,23 @@ class ICloudHME:
         except Exception:
             pass
         return "icloud.com.cn" if (h.endswith(".icloud.com.cn") or h == "icloud.com.cn") else "icloud.com"
+
+    @staticmethod
+    def _generate_client_id() -> str:
+        raw = bytearray(secrets.token_bytes(16))
+        raw[6] = (raw[6] & 0x0F) | 0x40
+        raw[8] = (raw[8] & 0x3F) | 0x80
+        text = raw.hex().upper()
+        return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
+
+    @staticmethod
+    def _extract_dsid(cookies: Dict[str, str]) -> str:
+        for name in ("X-APPLE-WEBAUTH-USER", "dsid"):
+            value = str(cookies.get(name, "")).strip()
+            if not value:
+                continue
+            return value.split("%", 1)[0]
+        return ""
 
     @property
     def setup_url(self) -> str:
@@ -262,6 +281,9 @@ class ICloudHME:
         params = parse_qs(parsed.query, keep_blank_values=True)
         params["clientBuildNumber"] = [CLIENT_BUILD_NUMBER]
         params["clientMasteringNumber"] = [CLIENT_BUILD_NUMBER]
+        params["clientId"] = [self._client_id]
+        if self._dsid:
+            params["dsid"] = [self._dsid]
         return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
     def _request(self, method: str, url: str, json_data: Any = None,
@@ -271,8 +293,8 @@ class ICloudHME:
             "Origin": self.origin,
             "Referer": self.origin + "/",
             "Accept": "application/json, text/plain, */*",
-            "Content-Type": "text/plain;charset=UTF-8" if "maildomainws" in urlparse(url).hostname
-            else "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
         }
 
         body = json.dumps(json_data, ensure_ascii=False) if json_data is not None else None
@@ -330,6 +352,8 @@ class ICloudHME:
             "fullName": str(ds_info.get("fullName", "") or ds_info.get("name", "")),
             "isManagedAppleId": bool(ds_info.get("isManagedAppleId", False)),
         }
+        if self._account_info["dsid"]:
+            self._dsid = self._account_info["dsid"]
         if not self._account_info["appleId"]:
             # fallback: 从 cookie 推断
             for name in ("aosappleid", "appleId", "dsid"):
@@ -360,38 +384,68 @@ class ICloudHME:
         self._log(f"共 {len(aliases)} 个别名")
         return aliases
 
-    def generate(self) -> str:
-        """生成候选别名 (未保留)"""
+    def generate_alias(self, lang_code: str = DEFAULT_HME_LANG) -> Dict:
+        """生成候选别名，返回 Apple HME result 字段。"""
         self._resolve_service()
         self._log("生成候选别名...")
-        response = self._request("POST", f"{self._service_url}/v1/hme/generate", max_attempts=2)
-        if not response.get("success"):
-            err = response.get("error", {})
-            raise RuntimeError(f"生成失败: {err.get('errorMessage', 'unknown')}")
-        hme = response.get("result", {}).get("hme", "")
+        response = self._request(
+            "POST",
+            f"{self._service_url}/v1/hme/generate",
+            json_data={"langCode": lang_code},
+            max_attempts=2,
+        )
+        self._ensure_success(response, "生成失败")
+        result = response.get("result", {}) if isinstance(response, dict) else {}
+        hme = result.get("hme", "") if isinstance(result, dict) else ""
         if isinstance(hme, dict):
             hme = hme.get("hme") or hme.get("email") or ""
+        if not hme:
+            raise RuntimeError("生成失败: API 未返回 result.hme")
         self._log(f"候选: {hme}")
-        return hme
+        return {"hme": str(hme).strip().lower()}
 
-    def reserve(self, hme: str, label: Optional[str] = None) -> str:
-        """保留/确认候选别名"""
+    def generate(self) -> str:
+        """生成候选别名 (未保留)。"""
+        return self.generate_alias()["hme"]
+
+    def reserve_alias(self, hme: str, label: Optional[str] = None,
+                      note: Optional[str] = None) -> Dict:
+        """保留/确认候选别名，payload 对齐 {hme,label,note}。"""
         self._resolve_service()
+        clean_hme = hme.strip().lower()
+        if not clean_hme:
+            raise ValueError("hme 不能为空")
         if not label:
             label = f"Created {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        self._log(f"保留别名 {hme} ...")
-        data = {"hme": hme, "label": label, "note": "Created by icloud_hme tool"}
-        response = self._request("POST", f"{self._service_url}/v1/hme/reserve", json_data=data, max_attempts=2)
-        if not response.get("success"):
-            err = response.get("error", {})
-            raise RuntimeError(f"保留失败: {err.get('errorMessage', 'unknown')}")
-        result = response.get("result", {}).get("hme", {})
-        alias = result.get("hme", hme) if isinstance(result, dict) else hme
-        self._log(f"已保留: {alias}")
+        if note is None:
+            note = "Created by icloud_hme tool"
+        self._log(f"保留别名 {clean_hme} ...")
+        response = self._request(
+            "POST",
+            f"{self._service_url}/v1/hme/reserve",
+            json_data={"hme": clean_hme, "label": label, "note": note},
+            max_attempts=2,
+        )
+        self._ensure_success(response, "保留失败")
+        alias = self._parse_single_alias(response, clean_hme)
+        if not alias.get("anonymousId"):
+            found = self.get_alias_by_email(clean_hme)
+            if found:
+                alias.update(found)
+        alias.setdefault("label", label or "")
+        alias.setdefault("note", note or "")
+        self._log(f"已保留: {alias.get('hme') or clean_hme}")
         return alias
 
-    def create_alias(self, label: Optional[str] = None, max_retries: int = 5) -> Dict:
-        """生成 + 保留，一步创建。返回 {'email': ..., 'label': ...}"""
+    def reserve(self, hme: str, label: Optional[str] = None) -> str:
+        """保留/确认候选别名，返回邮箱地址。"""
+        alias = self.reserve_alias(hme, label)
+        return alias.get("hme") or alias.get("email") or hme
+
+    def create_alias(self, label: Optional[str] = None,
+                     note: Optional[str] = None,
+                     max_retries: int = 5) -> Dict:
+        """生成 + 保留，一步创建。返回规范化别名对象。"""
         last_err = ""
         for attempt in range(max_retries):
             if attempt > 0:
@@ -408,8 +462,9 @@ class ICloudHME:
                     continue
                 break
             try:
-                email = self.reserve(hme, label)
-                return {"email": email, "label": label or "", "created_at": datetime.now().isoformat()}
+                alias = self.reserve_alias(hme, label, note)
+                alias["created_at"] = datetime.now().isoformat()
+                return alias
             except Exception as e:
                 last_err = str(e)
                 self._log(f"reserve 失败: {last_err}")
@@ -418,27 +473,70 @@ class ICloudHME:
                     continue
         raise RuntimeError(f"创建别名失败: {last_err}" if last_err else f"创建别名失败，已重试 {max_retries} 次")
 
-    def delete(self, anonymous_id: str) -> bool:
-        """删除别名 (必要时先停用再删除)"""
-        self._resolve_service()
-        self._log(f"删除 {anonymous_id} ...")
-        try:
-            resp = self._request("POST", f"{self._service_url}/v1/hme/delete",
-                                 json_data={"anonymousId": anonymous_id}, max_attempts=2)
-            if resp.get("success") is False:
-                raise RuntimeError(resp.get("error", {}).get("errorMessage", "delete failed"))
-        except Exception:
-            self._log("直接删除失败，尝试先停用...")
-            self._request("POST", f"{self._service_url}/v1/hme/deactivate",
-                         json_data={"anonymousId": anonymous_id}, max_attempts=2)
-            resp = self._request("POST", f"{self._service_url}/v1/hme/delete",
-                                 json_data={"anonymousId": anonymous_id}, max_attempts=2)
-            if resp.get("success") is False:
-                raise RuntimeError(resp.get("error", {}).get("errorMessage", "delete failed"))
-        self._log("已删除")
+    def get_alias_by_email(self, email: str) -> Optional[Dict]:
+        target = email.strip().lower()
+        for alias in self.list_aliases():
+            if alias.get("hme") == target or alias.get("email") == target:
+                return alias
+        return None
+
+    def deactivate(self, anonymous_id: str) -> bool:
+        """停用别名，payload 对齐 {anonymousId}."""
+        self._post_alias_action("deactivate", anonymous_id, "停用失败")
         return True
 
+    def reactivate(self, anonymous_id: str) -> bool:
+        """重新启用别名，payload 对齐 {anonymousId}."""
+        self._post_alias_action("reactivate", anonymous_id, "启用失败")
+        return True
+
+    def delete(self, anonymous_id: str) -> bool:
+        """删除别名；Apple 要求必要时先停用。"""
+        try:
+            self._post_alias_action("delete", anonymous_id, "删除失败")
+        except Exception:
+            self._log("直接删除失败，尝试先停用...")
+            self.deactivate(anonymous_id)
+            self._post_alias_action("delete", anonymous_id, "删除失败")
+        return True
+
+    def _post_alias_action(self, action: str, anonymous_id: str,
+                           error_prefix: str) -> Dict:
+        self._resolve_service()
+        clean_id = anonymous_id.strip()
+        if not clean_id:
+            raise ValueError("anonymousId 不能为空")
+        self._log(f"{action} {clean_id} ...")
+        response = self._request(
+            "POST",
+            f"{self._service_url}/v1/hme/{action}",
+            json_data={"anonymousId": clean_id},
+            max_attempts=2,
+        )
+        self._ensure_success(response, error_prefix)
+        return response
+
+    @staticmethod
+    def _ensure_success(response: Any, prefix: str):
+        if isinstance(response, dict) and response.get("success") is False:
+            err = response.get("error", {})
+            message = err.get("errorMessage") or err.get("reason") or "unknown"
+            raise RuntimeError(f"{prefix}: {message}")
+
     # ---- 解析 ----
+
+    @staticmethod
+    def _parse_single_alias(response: Any, fallback_hme: str = "") -> Dict:
+        if isinstance(response, dict):
+            result = response.get("result", {})
+            if isinstance(result, dict):
+                for key in ("hme", "hmeEmail", "email"):
+                    value = result.get(key)
+                    if isinstance(value, dict):
+                        return ICloudHME._normalize_alias(value, fallback_hme)
+                if "anonymousId" in result or "hme" in result:
+                    return ICloudHME._normalize_alias(result, fallback_hme)
+        return ICloudHME._normalize_alias({"hme": fallback_hme}, fallback_hme)
 
     @staticmethod
     def _parse_alias_list(response: Any) -> List[Dict]:
@@ -467,27 +565,35 @@ class ICloudHME:
         if not aliases_raw:
             return []
 
-        aliases = []
-        for item in aliases_raw:
-            if not isinstance(item, dict):
-                continue
-            email = str(
-                item.get("hme") or item.get("email") or item.get("alias")
-                or item.get("address") or item.get("metaData", {}).get("hme") or ""
-            ).strip().lower()
-            if not email or "@" not in email:
-                continue
-            state = str(item.get("state") or item.get("status") or "").lower()
-            aliases.append({
-                "email": email,
-                "anonymousId": str(item.get("anonymousId") or item.get("id") or ""),
-                "label": str(item.get("label") or item.get("metaData", {}).get("label") or ""),
-                "active": item.get("active", True) and item.get("isActive", True)
-                and state not in ("inactive", "deleted"),
-                "createdAt": item.get("createTimestamp") or item.get("createdAt"),
-            })
-        aliases.sort(key=lambda a: (not a["active"], a["email"]))
+        aliases = [ICloudHME._normalize_alias(item) for item in aliases_raw if isinstance(item, dict)]
+        aliases = [alias for alias in aliases if alias.get("hme")]
+        aliases.sort(key=lambda a: (not a["active"], a["hme"]))
         return aliases
+
+    @staticmethod
+    def _normalize_alias(item: Dict, fallback_hme: str = "") -> Dict:
+        meta = item.get("metaData", {}) if isinstance(item.get("metaData"), dict) else {}
+        email = str(
+            item.get("hme") or item.get("email") or item.get("alias")
+            or item.get("address") or meta.get("hme") or fallback_hme or ""
+        ).strip().lower()
+        state = str(item.get("state") or item.get("status") or "").lower()
+        is_active = item.get("isActive", item.get("active", True))
+        active = bool(is_active) and state not in ("inactive", "deleted")
+        created = item.get("createTimestamp") or item.get("createdAt")
+        return {
+            "hme": email,
+            "email": email,
+            "label": str(item.get("label") or meta.get("label") or ""),
+            "note": str(item.get("note") or meta.get("note") or ""),
+            "isActive": active,
+            "active": active,
+            "createTimestamp": created,
+            "createdAt": created,
+            "anonymousId": str(item.get("anonymousId") or item.get("id") or ""),
+            "forwardToEmail": str(item.get("forwardToEmail") or ""),
+            "origin": str(item.get("origin") or ""),
+        }
 
 
 # ============================================================

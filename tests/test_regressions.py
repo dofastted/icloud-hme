@@ -79,22 +79,27 @@ def test_mail_cache_basic():
     """邮件缓存基本读写"""
     from mail_cache import MailCache
     cache = MailCache()
+    acc_id = "test_regressions_mail_cache"
+    cache.clear_account(acc_id)
     
-    emails = [
-        {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello", "date": "2025-01-01T00:00:00"},
-        {"id": "2", "from": "c@d.com", "to": "y@icloud.com", "subject": "World", "date": "2025-01-02T00:00:00"},
-        {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello Duplicate", "date": "2025-01-03T00:00:00"},
-    ]
-    
-    cache.set_inbox("test_acc", emails)
-    cached = cache.get_inbox("test_acc")
-    
-    # 应该有 2 封（第 3 封 id 重复被去重）
-    assert len(cached) == 2, f"期望 2 封，实际 {len(cached)}"
-    
-    # 清理
-    cache.clear_account("test_acc")
-    assert len(cache.get_inbox("test_acc")) == 0
+    try:
+        cache.set_inbox(acc_id, [
+            {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello", "date": "2025-01-01T00:00:00"},
+            {"id": "2", "from": "c@d.com", "to": "y@icloud.com", "subject": "World", "date": "2025-01-02T00:00:00"},
+        ])
+        cache.set_inbox(acc_id, [
+            {"id": "1", "from": "a@b.com", "to": "x@icloud.com", "subject": "Hello Duplicate", "date": "2025-01-03T00:00:00"},
+            {"id": "3", "from": "e@f.com", "to": "z@icloud.com", "subject": "New", "date": "2025-01-04T00:00:00"},
+        ])
+        cached = cache.get_inbox(acc_id)
+        
+        # 增量写入时，已缓存的 id 不应被重复追加
+        assert len(cached) == 3, f"期望 3 封，实际 {len(cached)}"
+        assert [email["id"] for email in cached] == ["1", "2", "3"]
+        assert cached[0]["subject"] == "Hello"
+    finally:
+        cache.clear_account(acc_id)
+    assert len(cache.get_inbox(acc_id)) == 0
     print("  PASS test_mail_cache_basic")
 
 
@@ -132,6 +137,88 @@ def test_icloud_hme_account_info():
     print("  PASS test_icloud_hme_account_info")
 
 
+
+def test_icloud_hme_build_url_adds_required_query_params():
+    """HME API URL 必须带 Apple Web 必需的查询参数"""
+    from urllib.parse import parse_qs, urlparse
+    from icloud_hme import CLIENT_BUILD_NUMBER, ICloudHME
+
+    client = ICloudHME({"X-APPLE-WEBAUTH-USER": "123456%3Aignored"}, verbose=False)
+    client._client_id = "00000000-1111-4222-8333-444444444444"
+
+    built = client._build_url("https://p01-maildomainws.icloud.com/v1/hme/list?existing=keep")
+    query = parse_qs(urlparse(built).query)
+
+    assert query["existing"] == ["keep"]
+    assert query["clientBuildNumber"] == [CLIENT_BUILD_NUMBER]
+    assert query["clientMasteringNumber"] == [CLIENT_BUILD_NUMBER]
+    assert query["clientId"] == ["00000000-1111-4222-8333-444444444444"]
+    assert query["dsid"] == ["123456"]
+    print("  PASS test_icloud_hme_build_url_adds_required_query_params")
+
+
+def test_icloud_hme_normalize_alias_preserves_apple_fields():
+    """Apple HME 字段名在规范化输出中保持兼容"""
+    from icloud_hme import ICloudHME
+
+    alias = ICloudHME._normalize_alias({
+        "hme": "Alias@Privaterelay.AppleID.com",
+        "label": "Login alias",
+        "note": "Created for regression coverage",
+        "isActive": False,
+        "createTimestamp": 1712345678000,
+        "anonymousId": "anon-123",
+        "forwardToEmail": "real@example.com",
+        "origin": "https://example.com",
+    })
+
+    assert alias["hme"] == "alias@privaterelay.appleid.com"
+    assert alias["label"] == "Login alias"
+    assert alias["note"] == "Created for regression coverage"
+    assert alias["isActive"] is False
+    assert alias["createTimestamp"] == 1712345678000
+    assert alias["anonymousId"] == "anon-123"
+    assert alias["forwardToEmail"] == "real@example.com"
+    assert alias["origin"] == "https://example.com"
+    print("  PASS test_icloud_hme_normalize_alias_preserves_apple_fields")
+
+
+def test_api_key_store_create_verify_and_revoke_isolated():
+    """API Key 明文只在创建时返回，并按 active 状态鉴权"""
+    import tempfile
+    from api_keys import APIKeyStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = APIKeyStore(Path(tmpdir) / "api_keys.json")
+        created = store.create("regression")
+        raw_key = created.get("api_key", "")
+
+        assert raw_key.startswith("hme_")
+        verified = store.verify(raw_key)
+        assert verified is not None
+        assert verified["id"] == created["id"]
+        assert store.verify(raw_key + "wrong") is None
+
+        assert store.deactivate(created["id"]) is True
+        assert store.verify(raw_key) is None
+    print("  PASS test_api_key_store_create_verify_and_revoke_isolated")
+
+
+def test_extract_verification_code_multilingual_and_rejects_alpha_noise():
+    """验证码提取支持中英文正文，并拒绝纯字母噪声"""
+    from icloud_mail import ICloudMail
+
+    cases = [
+        ("中文数字验证码", "您的验证码是 482913，请在 10 分钟内完成验证。", "482913"),
+        ("英文混合验证码", "Use verification code A1B2C3 to finish signing in.", "A1B2C3"),
+        ("纯字母噪声", "Your verification code is ABCDEF", ""),
+    ]
+
+    for name, body, expected in cases:
+        actual = ICloudMail.extract_verification_code(body)
+        assert actual == expected, f"{name}: expected {expected!r}, got {actual!r}"
+    print("  PASS test_extract_verification_code_multilingual_and_rejects_alpha_noise")
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -144,6 +231,10 @@ if __name__ == "__main__":
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),
         ("icloud_hme_account_info", test_icloud_hme_account_info),
+        ("icloud_hme_build_url_adds_required_query_params", test_icloud_hme_build_url_adds_required_query_params),
+        ("icloud_hme_normalize_alias_preserves_apple_fields", test_icloud_hme_normalize_alias_preserves_apple_fields),
+        ("api_key_store_create_verify_and_revoke_isolated", test_api_key_store_create_verify_and_revoke_isolated),
+        ("extract_verification_code_multilingual_and_rejects_alpha_noise", test_extract_verification_code_multilingual_and_rejects_alpha_noise),
     ]
     
     passed = 0

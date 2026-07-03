@@ -20,6 +20,7 @@ iCloud Mail — IMAP 收件箱检查模块
 
 import imaplib
 import email
+import re
 import time
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -29,6 +30,10 @@ from typing import Optional, Dict, List
 IMAP_SERVER = "imap.mail.me.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 20
+CODE_PATTERNS = [
+    re.compile(r"(?<!\d)(\d{4,8})(?!\d)"),
+    re.compile(r"(?<![A-Za-z0-9])([A-Z0-9]{4,8})(?![A-Za-z0-9])", re.IGNORECASE),
+]
 
 
 class ICloudMail:
@@ -93,6 +98,50 @@ class ICloudMail:
         except Exception:
             all_msgs = self._search_and_fetch(None, limit * 3, days)
             return [m for m in all_msgs if recipient.lower() in m.get("to", "").lower()][:limit]
+
+    def find_verification_codes(self, recipient: str = "",
+                                limit: int = 10, days: int = 1) -> List[Dict]:
+        """从最近邮件中提取验证码。"""
+        self._ensure_connected()
+        search_limit = max(limit * 3, 20)
+        if recipient:
+            headers = self.find_by_recipient(recipient, search_limit, days)
+        else:
+            headers = self.check_inbox(search_limit, days)
+        codes: List[Dict] = []
+        for header in headers:
+            msg_id = str(header.get("id", "")).encode()
+            full = self.fetch_full(msg_id) if msg_id else None
+            body = (full or {}).get("body", "")
+            text = "\n".join([header.get("subject", ""), body])
+            code = self.extract_verification_code(text)
+            if not code:
+                continue
+            item = dict(header)
+            item["code"] = code
+            item["body_preview"] = body[:300]
+            codes.append(item)
+            if len(codes) >= limit:
+                break
+        return codes
+
+    @staticmethod
+    def extract_verification_code(text: str) -> str:
+        if not text:
+            return ""
+        lowered = text.lower()
+        has_hint = any(word in lowered for word in (
+            "code", "verification", "verify", "otp", "pin",
+            "验证码", "校验码", "验证", "一次性",
+        ))
+        for pattern in CODE_PATTERNS:
+            for match in pattern.finditer(text):
+                code = match.group(1).strip()
+                if code.isalpha():
+                    continue
+                if has_hint or code.isdigit():
+                    return code
+        return ""
 
     def stream_inbox(self, limit: int = 50, days: int = 7):
         self._ensure_connected()

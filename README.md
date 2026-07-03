@@ -73,6 +73,34 @@ python icloud_hme.py create -n 5 --cookies cookies.json
 python icloud_hme.py delete --email xxx@icloud.com --cookies cookies.json
 ```
 
+### API Key 与接口
+
+首次创建 API Key（仅无 key 时开放）：
+
+```bash
+curl -X POST http://127.0.0.1:5050/api/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"default"}'
+```
+
+后续请求使用 `Authorization: Bearer <api_key>` 或 `X-API-Key: <api_key>`。
+
+核心接口：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/accounts` | 导入 Cookie 并校验 iCloud 会话 |
+| `POST` | `/api/v1/accounts/{id}/session/validate` | 重新校验登录会话 |
+| `POST` | `/api/v1/accounts/{id}/hme/generate` | 生成未预留候选别名，返回 `result.hme` |
+| `POST` | `/api/v1/accounts/{id}/hme/reserve` | 预留候选别名，body 为 `hme,label,note` |
+| `GET` | `/api/v1/accounts/{id}/aliases` | 列出别名，字段对齐 Apple HME |
+| `POST` | `/api/v1/accounts/{id}/aliases/{anonymousId}/deactivate` | 停用别名 |
+| `DELETE` | `/api/v1/accounts/{id}/aliases/{anonymousId}` | 删除别名 |
+| `POST` | `/api/v1/accounts/{id}/imap` | 保存 iCloud 邮箱和 App 专用密码 |
+| `GET` | `/api/v1/accounts/{id}/verification-codes?alias=...` | 从 IMAP 邮件提取验证码 |
+
+别名对象字段对齐 Apple HME：`hme`、`label`、`note`、`isActive`、`createTimestamp`、`anonymousId`、`forwardToEmail`、`origin`。
+
 ## Cookie 获取
 
 | 方式 | 说明 |
