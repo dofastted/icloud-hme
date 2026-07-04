@@ -34,6 +34,9 @@ OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
 SCHEDULER_ALIAS_LIMIT = int(os.environ.get("HME_SCHEDULER_ALIAS_LIMIT", "750"))
+DEFAULT_GROUP_ID = "grp_default"
+DEFAULT_GROUP_NAME = "默认分组"
+DEFAULT_GROUP_COLOR = "#1f8b4c"
 MAIL_PROVIDER_HOSTS = {
     "icloud.com": "imap.mail.me.com",
     "me.com": "imap.mail.me.com",
@@ -48,6 +51,14 @@ MAIL_PROVIDER_HOSTS = {
     "hotmail.com": "imap-mail.outlook.com",
     "live.com": "imap-mail.outlook.com",
 }
+
+def normalize_group_color(color: str) -> str:
+    value = str(color or "").strip()
+    if len(value) in (4, 7) and value.startswith("#"):
+        digits = value[1:]
+        if all(ch in "0123456789abcdefABCDEF" for ch in digits):
+            return "#" + digits.lower()
+    return DEFAULT_GROUP_COLOR
 
 
 def infer_mail_host(email: str) -> str:
@@ -96,6 +107,7 @@ class AccountManager:
 
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
+        self.groups: Dict[str, Dict] = {}
         self._lock = threading.RLock()
         self._cache = get_cache()
         self._load()
@@ -112,14 +124,29 @@ class AccountManager:
             try:
                 data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
                 self.accounts = data.get("accounts", {})
+                groups = data.get("groups", {})
+                if isinstance(groups, list):
+                    self.groups = {
+                        str(g.get("id")): g for g in groups
+                        if isinstance(g, dict) and g.get("id")
+                    }
+                elif isinstance(groups, dict):
+                    self.groups = groups
             except (json.JSONDecodeError, OSError):
                 self.accounts = {}
+                self.groups = {}
+
+        changed = self._normalize_loaded_state()
+        if changed:
+            self._save()
 
     def _save(self):
         with self._lock:
+            self._normalize_loaded_state()
             ACCOUNTS_FILE.write_text(
                 json.dumps({
                     "accounts": self.accounts,
+                    "groups": self.groups,
                     "updated_at": datetime.now().isoformat(),
                 }, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -143,6 +170,7 @@ class AccountManager:
             "status": "active",
             "alias_total": 0,
             "alias_active": 0,
+            "group_id": DEFAULT_GROUP_ID,
             "last_validated": None,
             "last_error": None,
             "created_at": datetime.now().isoformat(),
@@ -155,6 +183,251 @@ class AccountManager:
 
     def _generate_id(self) -> str:
         return "acc_" + uuid.uuid4().hex[:8]
+
+    def _generate_group_id(self) -> str:
+        return "grp_" + uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _default_group() -> Dict[str, Any]:
+        return {
+            "id": DEFAULT_GROUP_ID,
+            "name": DEFAULT_GROUP_NAME,
+            "description": "",
+            "color": DEFAULT_GROUP_COLOR,
+            "sort_order": 0,
+            "is_default": True,
+            "created_at": datetime.now().isoformat(),
+        }
+
+    def _normalize_loaded_state(self) -> bool:
+        changed = False
+        if not isinstance(self.groups, dict):
+            self.groups = {}
+            changed = True
+
+        if DEFAULT_GROUP_ID not in self.groups:
+            self.groups[DEFAULT_GROUP_ID] = self._default_group()
+            changed = True
+
+        for gid, group in list(self.groups.items()):
+            if not isinstance(group, dict):
+                del self.groups[gid]
+                changed = True
+                continue
+            normalized_id = str(group.get("id") or gid).strip()
+            if normalized_id != gid:
+                del self.groups[gid]
+                gid = normalized_id or self._generate_group_id()
+                self.groups[gid] = group
+                changed = True
+            if group.get("id") != gid:
+                group["id"] = gid
+                changed = True
+            if not str(group.get("name") or "").strip():
+                group["name"] = DEFAULT_GROUP_NAME if gid == DEFAULT_GROUP_ID else gid
+                changed = True
+            normalized_color = normalize_group_color(group.get("color"))
+            if group.get("color") != normalized_color:
+                group["color"] = normalized_color
+                changed = True
+            if "description" not in group:
+                group["description"] = ""
+                changed = True
+            if "created_at" not in group:
+                group["created_at"] = datetime.now().isoformat()
+                changed = True
+            try:
+                group["sort_order"] = int(group.get("sort_order") or 0)
+            except (TypeError, ValueError):
+                group["sort_order"] = 0
+                changed = True
+            is_default = gid == DEFAULT_GROUP_ID
+            if group.get("is_default") is not is_default:
+                group["is_default"] = is_default
+                changed = True
+
+        if DEFAULT_GROUP_ID not in self.groups:
+            self.groups[DEFAULT_GROUP_ID] = self._default_group()
+            changed = True
+
+        default = self.groups[DEFAULT_GROUP_ID]
+        if default.get("sort_order") != 0:
+            default["sort_order"] = 0
+            changed = True
+
+        for account in self.accounts.values():
+            if account.get("group_id") not in self.groups:
+                account["group_id"] = DEFAULT_GROUP_ID
+                changed = True
+
+        return changed
+
+    def _group_id_from_input(self, group_id: Any, default: str = DEFAULT_GROUP_ID) -> str:
+        gid = str(group_id or "").strip()
+        if not gid:
+            return default
+        if gid not in self.groups:
+            raise ValueError("分组不存在")
+        return gid
+
+    def _account_with_group(self, account: Dict) -> Dict:
+        item = dict(account)
+        gid = item.get("group_id") if item.get("group_id") in self.groups else DEFAULT_GROUP_ID
+        group = self.groups.get(gid, self.groups[DEFAULT_GROUP_ID])
+        item["group_id"] = gid
+        item["group_name"] = group.get("name", "")
+        item["group_color"] = group.get("color", "")
+        return item
+
+    def _movable_group_ids(self, exclude_group_id: Optional[str] = None) -> List[str]:
+        return [
+            group["id"] for group in sorted(
+                self.groups.values(),
+                key=lambda g: (int(g.get("sort_order") or 0), g.get("created_at", ""), g.get("id", "")),
+            )
+            if group.get("id") != DEFAULT_GROUP_ID and group.get("id") != exclude_group_id
+        ]
+
+    def _apply_group_order(self, group_ids: List[str]):
+        self.groups[DEFAULT_GROUP_ID]["sort_order"] = 0
+        for index, group_id in enumerate(group_ids, start=1):
+            self.groups[group_id]["sort_order"] = index
+
+    def _set_group_position(self, group_id: str, sort_position: Optional[int]):
+        if group_id == DEFAULT_GROUP_ID:
+            return
+        group_ids = self._movable_group_ids(exclude_group_id=group_id)
+        max_position = len(group_ids) + 1
+        if sort_position is None:
+            target = max_position
+        else:
+            target = max(1, min(int(sort_position), max_position))
+        group_ids.insert(target - 1, group_id)
+        self._apply_group_order(group_ids)
+
+    def list_groups(self) -> List[Dict]:
+        self._normalize_loaded_state()
+        counts: Dict[str, int] = {gid: 0 for gid in self.groups}
+        for account in self.accounts.values():
+            gid = account.get("group_id") if account.get("group_id") in self.groups else DEFAULT_GROUP_ID
+            counts[gid] = counts.get(gid, 0) + 1
+        groups = sorted(
+            self.groups.values(),
+            key=lambda g: (g.get("id") != DEFAULT_GROUP_ID, int(g.get("sort_order") or 0), g.get("name", "")),
+        )
+        result = []
+        for group in groups:
+            item = dict(group)
+            item["account_count"] = counts.get(group["id"], 0)
+            result.append(item)
+        return result
+
+    def get_group(self, group_id: str) -> Optional[Dict]:
+        group = self.groups.get(str(group_id or "").strip())
+        if not group:
+            return None
+        item = dict(group)
+        item["account_count"] = sum(1 for a in self.accounts.values() if a.get("group_id") == item["id"])
+        return item
+
+    def add_group(self, name: str, description: str = "", color: str = "", sort_position: Optional[int] = None) -> Dict:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("分组名称不能为空")
+        lowered = clean_name.lower()
+        if any(str(g.get("name") or "").strip().lower() == lowered for g in self.groups.values()):
+            raise ValueError("分组名称已存在")
+        with self._lock:
+            group_id = self._generate_group_id()
+            self.groups[group_id] = {
+                "id": group_id,
+                "name": clean_name,
+                "description": str(description or "").strip(),
+                "color": normalize_group_color(color),
+                "sort_order": 999999,
+                "is_default": False,
+                "created_at": datetime.now().isoformat(),
+            }
+            self._set_group_position(group_id, sort_position)
+            self._save()
+            return self.get_group(group_id) or dict(self.groups[group_id])
+
+    def update_group(self, group_id: str, name: str, description: str = "", color: str = "", sort_position: Optional[int] = None) -> Dict:
+        gid = str(group_id or "").strip()
+        if gid not in self.groups:
+            raise KeyError("分组不存在")
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("分组名称不能为空")
+        lowered = clean_name.lower()
+        for other_id, group in self.groups.items():
+            if other_id != gid and str(group.get("name") or "").strip().lower() == lowered:
+                raise ValueError("分组名称已存在")
+        with self._lock:
+            self.groups[gid].update({
+                "name": clean_name,
+                "description": str(description or "").strip(),
+                "color": normalize_group_color(color),
+            })
+            self._set_group_position(gid, sort_position)
+            self._save()
+            return self.get_group(gid) or dict(self.groups[gid])
+
+    def delete_group(self, group_id: str) -> bool:
+        gid = str(group_id or "").strip()
+        if gid == DEFAULT_GROUP_ID:
+            raise ValueError("默认分组不能删除")
+        if gid not in self.groups:
+            raise KeyError("分组不存在")
+        with self._lock:
+            for account in self.accounts.values():
+                if account.get("group_id") == gid:
+                    account["group_id"] = DEFAULT_GROUP_ID
+            del self.groups[gid]
+            self._apply_group_order(self._movable_group_ids())
+            self._save()
+        return True
+
+    def reorder_groups(self, group_ids: List[str]) -> bool:
+        normalized = [str(gid or "").strip() for gid in group_ids]
+        movable = self._movable_group_ids()
+        if set(normalized) != set(movable) or len(normalized) != len(movable):
+            raise ValueError("分组排序参数无效")
+        with self._lock:
+            self._apply_group_order(normalized)
+            self._save()
+        return True
+
+    def move_accounts_to_group(self, account_ids: List[str], group_id: str) -> int:
+        gid = self._group_id_from_input(group_id)
+        moved = 0
+        with self._lock:
+            for acc_id in account_ids:
+                account = self.accounts.get(str(acc_id or "").strip())
+                if account:
+                    account["group_id"] = gid
+                    moved += 1
+            if moved:
+                self._save()
+        return moved
+
+    @staticmethod
+    def _account_identity_values(account: Dict) -> set[str]:
+        values = set()
+        for key in ("real_email", "icloud_email"):
+            value = str(account.get(key) or "").strip().lower()
+            if value:
+                values.add(value)
+        return values
+
+    def _find_account_by_identity(self, account: Dict) -> Optional[Dict]:
+        identities = self._account_identity_values(account)
+        if not identities:
+            return None
+        for existing in self.accounts.values():
+            if identities & self._account_identity_values(existing):
+                return existing
+        return None
 
     @staticmethod
     def parse_cookie_input(raw: str) -> Dict[str, str]:
@@ -188,31 +461,19 @@ class AccountManager:
 
         return cookies
 
-    def add_account(
-        self, name: str, cookie_input: str, host: str = "icloud.com"
-    ) -> Dict:
+    @staticmethod
+    def cookies_to_header(cookies: Dict) -> str:
+        return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+    def _refresh_session_state(self, account: Dict) -> Dict:
         from icloud_hme import ICloudHME
 
-        cookies = self.parse_cookie_input(cookie_input)
-        acc_id = self._generate_id()
-
-        account: Dict[str, Any] = {
-            "id": acc_id,
-            "name": name,
-            "real_email": "",
-            "icloud_email": "",
-            "cookies": cookies,
-            "host": host,
-            "status": "active",
-            "alias_total": 0,
-            "alias_active": 0,
-            "last_validated": None,
-            "last_error": None,
-            "created_at": datetime.now().isoformat(),
-        }
-
         try:
-            client = ICloudHME(cookies, host=host, verbose=False)
+            client = ICloudHME(
+                account["cookies"],
+                host=account.get("host", "icloud.com"),
+                verbose=False,
+            )
             client.validate_session()
             info = client.get_account_info()
             if info:
@@ -231,15 +492,104 @@ class AccountManager:
             except Exception:
                 pass
 
+            account["status"] = "active"
             account["last_validated"] = datetime.now().isoformat()
             account["last_error"] = None
         except Exception as e:
             account["status"] = "error"
             account["last_error"] = str(e)[:300]
 
-        self.accounts[acc_id] = account
-        self._save()
         return account
+
+    def add_account(
+        self, name: str, cookie_input: str, host: str = "icloud.com",
+        group_id: str = "",
+    ) -> Dict:
+        cookies = self.parse_cookie_input(cookie_input)
+        acc_id = self._generate_id()
+        requested_group_id = self._group_id_from_input(group_id)
+
+        account: Dict[str, Any] = {
+            "id": acc_id,
+            "name": name,
+            "real_email": "",
+            "icloud_email": "",
+            "cookies": cookies,
+            "host": host,
+            "status": "active",
+            "alias_total": 0,
+            "alias_active": 0,
+            "group_id": requested_group_id,
+            "last_validated": None,
+            "last_error": None,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        self._refresh_session_state(account)
+        with self._lock:
+            duplicate = self._find_account_by_identity(account)
+            if duplicate:
+                account["id"] = duplicate["id"]
+                account["name"] = duplicate.get("name") or account["name"]
+                account["created_at"] = duplicate.get("created_at") or account["created_at"]
+                if not str(group_id or "").strip():
+                    account["group_id"] = duplicate.get("group_id") or DEFAULT_GROUP_ID
+                for key in ("mail_email", "mail_password", "mail_host", "mail_port"):
+                    if duplicate.get(key) and not account.get(key):
+                        account[key] = duplicate[key]
+                self.accounts[duplicate["id"]] = account
+            else:
+                self.accounts[acc_id] = account
+            self._save()
+        return self._account_with_group(account)
+
+    def get_account_session(self, acc_id: str) -> Dict:
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        item = self._account_with_group(account)
+        return {
+            "id": item.get("id", acc_id),
+            "name": item.get("name", ""),
+            "real_email": item.get("real_email", ""),
+            "host": item.get("host", "icloud.com"),
+            "status": item.get("status", ""),
+            "group_id": item.get("group_id", DEFAULT_GROUP_ID),
+            "group_name": item.get("group_name", ""),
+            "group_color": item.get("group_color", ""),
+            "cookie_input": self.cookies_to_header(item.get("cookies", {})),
+        }
+
+    def update_account_session(
+        self, acc_id: str, name: str, cookie_input: str, host: str = "icloud.com",
+        group_id: Optional[str] = None,
+    ) -> Dict:
+        cookies = self.parse_cookie_input(cookie_input)
+        with self._lock:
+            current = self.accounts.get(acc_id)
+            if not current:
+                raise KeyError(f"账号不存在: {acc_id}")
+            account = dict(current)
+
+        account.update({
+            "name": str(name or account.get("name") or "未命名账号").strip() or "未命名账号",
+            "cookies": cookies,
+            "host": str(host or account.get("host") or "icloud.com").strip() or "icloud.com",
+        })
+        if group_id is not None:
+            account["group_id"] = self._group_id_from_input(group_id, account.get("group_id") or DEFAULT_GROUP_ID)
+        self._refresh_session_state(account)
+
+        with self._lock:
+            if acc_id not in self.accounts:
+                raise KeyError(f"账号不存在: {acc_id}")
+            duplicate = self._find_account_by_identity(account)
+            if duplicate and duplicate.get("id") != acc_id:
+                label = duplicate.get("name") or duplicate.get("real_email") or duplicate.get("id")
+                raise ValueError(f"该会话属于已存在账号: {label}")
+            self.accounts[acc_id] = account
+            self._save()
+            return self._account_with_group(account)
 
     def remove_account(self, acc_id: str) -> bool:
         if acc_id in self.accounts:
@@ -249,20 +599,25 @@ class AccountManager:
         return False
 
     def get_account(self, acc_id: str) -> Optional[Dict]:
-        return self.accounts.get(acc_id)
+        account = self.accounts.get(acc_id)
+        if not account:
+            return None
+        return self._account_with_group(account)
 
     def list_accounts(self) -> List[Dict]:
         return sorted(
-            self.accounts.values(),
+            (self._account_with_group(account) for account in self.accounts.values()),
             key=lambda a: (a.get("status") != "active", a.get("created_at", "")),
         )
 
     def update_account(self, acc_id: str, **kwargs) -> Optional[Dict]:
         with self._lock:
             if acc_id in self.accounts:
+                if "group_id" in kwargs:
+                    kwargs["group_id"] = self._group_id_from_input(kwargs["group_id"])
                 self.accounts[acc_id].update(kwargs)
                 self._save()
-                return dict(self.accounts[acc_id])
+                return self._account_with_group(self.accounts[acc_id])
             return None
 
     @staticmethod
@@ -639,10 +994,14 @@ class AccountManager:
     def get_all_aliases(self) -> List[Dict]:
         all_aliases: List[Dict] = []
         for acc_id, account in self.accounts.items():
+            account_with_group = self._account_with_group(account)
             for alias in self.get_aliases_for_account(acc_id):
                 alias["account_id"] = acc_id
                 alias["account_name"] = account.get("name", "")
                 alias["account_email"] = account.get("real_email", "")
+                alias["group_id"] = account_with_group.get("group_id", DEFAULT_GROUP_ID)
+                alias["group_name"] = account_with_group.get("group_name", "")
+                alias["group_color"] = account_with_group.get("group_color", "")
                 all_aliases.append(alias)
         return all_aliases
 

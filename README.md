@@ -41,9 +41,10 @@ python web_ui.py --scheduler        # 启动 Web 后自动开启调度器
 
 | 模块 | 功能 |
 |------|------|
-| **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话 |
+| **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话，支持选择所属分组 |
+| **分组管理** | 创建/编辑/删除账号分组，自定义颜色，删除分组时账号回到默认分组 |
 | **仪表盘** | 账号总数、总别名数、今日创建数，每账号一张状态卡片 |
-| **别名列表** | 实时拉取所有别名，标注所属账号 + 真实邮箱 |
+| **别名列表** | 实时拉取所有别名，标注所属账号、真实邮箱和分组 |
 | **邮箱详情** | 搜索单个 HME 邮箱，查看最新邮件，按需展开正文 |
 | **共享管理** | 为单个 HME 邮箱生成/吊销公网只读 shared 链接 |
 | **批量创建** | 勾选目标账号 → 输入数量 → 跨账号轮询创建 |
@@ -55,7 +56,7 @@ python web_ui.py --scheduler        # 启动 Web 后自动开启调度器
 scripts/install-autostart-service.sh
 ```
 
-脚本需要 systemd 正在运行；会安装并启用 `icloud-hme.service`，服务启动命令固定带 `--scheduler`，并设置 `AUTO_START_SCHEDULER=1`。系统重启或服务重启后，Web UI 和调度器会一起启动。
+脚本需要 systemd 正在运行；会安装并启用 `icloud-hme.service`，服务启动命令固定带 `--scheduler --no-sync`，并设置 `AUTO_START_SCHEDULER=1`。脚本会执行 `daemon-reload`、`enable` 和 `restart`，因此重新运行脚本会立即加载新的服务配置。系统重启或服务重启后，Web UI 和调度器会一起启动。
 
 可选覆盖：
 
@@ -64,6 +65,8 @@ PORT=8080 HOST=0.0.0.0 SERVICE_NAME=icloud-hme.service scripts/install-autostart
 ```
 
 调度规则：只调度活跃账号；单账号本地/刷新后的 `alias_total >= 750` 时跳过，不再创建新 HME。
+
+服务单元会使用项目目录的 `.venv/bin/python`（如存在），否则使用当前 `python`，并设置 `PYTHONPATH` 与 `RequiresMountsFor`，避免开机时项目目录或依赖未就绪导致服务启动失败。
 
 
 ### 命令行调度器
@@ -111,6 +114,7 @@ curl -X POST http://127.0.0.1:5050/api/keys \
 | `GET` | `/api/v1/config` | 主配置入口：返回 API base、鉴权方式、可用入口和 shared 主入口 |
 | `GET` | `/api/v1/hme/available` | 用一把 API Key 全局列出可用 HME，跨账号聚合 |
 | `GET` | `/api/v1/hme/available/next?include_latest=1` | 返回一个可用 HME，可选带最新邮件 |
+| `GET` | `/api/v1/accounts` | 列出账号与分组摘要，账号字段已脱敏 |
 | `GET` | `/api/v1/hme/{alias}/latest?force=0` | 通过一把 API Key 全局读取指定 HME 最新邮件 |
 | `POST` | `/api/v1/accounts` | 导入 Cookie 并校验 iCloud 会话 |
 | `POST` | `/api/v1/accounts/{id}/session/validate` | 重新校验登录会话 |
@@ -120,7 +124,7 @@ curl -X POST http://127.0.0.1:5050/api/keys \
 | `GET` | `/api/v1/accounts/{id}/aliases` | 列出别名，字段对齐 Apple HME |
 | `POST` | `/api/v1/accounts/{id}/aliases/{anonymousId}/deactivate` | 停用别名 |
 | `DELETE` | `/api/v1/accounts/{id}/aliases/{anonymousId}` | 删除别名 |
-| `GET` | `/api/v1/mailboxes?q=&account_id=&status=` | 搜索/列出全部 HME 邮箱 |
+| `GET` | `/api/v1/mailboxes?q=&account_id=&group_id=&status=` | 搜索/列出全部 HME 邮箱，可按账号或分组过滤 |
 | `GET` | `/api/v1/mailboxes/search?q=xxx` | 邮箱搜索快捷入口 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages?limit=1` | 读取指定 HME 邮箱邮件，默认最新一封 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages/{message_id}` | 读取指定邮件正文详情 |
@@ -235,7 +239,7 @@ curl -X POST http://127.0.0.1:5050/api/shared/latest \
 运行时生成：
 
 ```
-accounts.json          # 所有账号及 Cookie（自动持久化）
+accounts.json          # 所有账号、分组及 Cookie（自动持久化）
 shared_mailboxes.json  # shared key 摘要、prefix、访问统计
 scheduler_state.json   # 调度器历史状态
 logs/                  # 运行日志

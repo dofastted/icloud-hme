@@ -18,14 +18,16 @@
     const p = params();
     const q = p.get('q') || '';
     const account = p.get('account') || '';
+    const group = p.get('group_id') || p.get('group') || '';
     const status = p.get('status') || '';
     try {
-      const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&status=' + encodeURIComponent(status) + '&limit=200' + (refresh ? '&refresh=1' : '');
+      const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&group_id=' + encodeURIComponent(group) + '&status=' + encodeURIComponent(status) + '&limit=200' + (refresh ? '&refresh=1' : '');
       const data = await S.api('/api/mailboxes?' + query);
       S.mailboxes = data.mailboxes || [];
       const accountOptions = ['<option value="">全部账号</option>'].concat(S.accounts.map(a => '<option value="' + S.esc(a.id) + '"' + (a.id === account ? ' selected' : '') + '>' + S.esc(a.name || a.id) + '</option>')).join('');
+      const groupOptions = ['<option value="">全部分组</option>'].concat((S.groups || []).map(g => '<option value="' + S.esc(g.id) + '"' + (g.id === group ? ' selected' : '') + '>' + S.esc(g.name || g.id) + '</option>')).join('');
       const syncLabel = refresh ? '同步完成' : '云端同步';
-      const filter = '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select><button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
+      const filter = '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxGroup">' + groupOptions + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select><button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
       if (!S.mailboxes.length) {
         S.view('<div class="panel"><div class="panel-head">隐私邮箱</div>' + filter + S.empty('暂无邮箱 - 去仪表盘或批量创建生成', '<button class="btn btn-sm" onclick="HME.navigate(\'#/batch\')">去批量创建</button>') + '</div>');
         bindFilters();
@@ -34,9 +36,10 @@
       const rows = S.mailboxes.map((m, i) => {
         const aliasArg = S.inlineArg(m.alias_email);
         const routeArg = S.inlineArg('#/mailbox/' + encodeURIComponent(m.alias_email));
-        return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + S.esc(m.label || '') + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(' + aliasArg + ')">复制</button> <button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">兑换码</button></td></tr>';
+        const groupLabel = m.group_name ? '<span class="badge" style="border-color:' + S.esc(m.group_color || '#ddd') + '">' + S.esc(m.group_name) + '</span>' : '--';
+        return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupLabel + '</td><td>' + S.esc(m.label || '') + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(' + aliasArg + ')">复制</button> <button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">兑换码</button></td></tr>';
       }).join('');
-      S.view('<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span>' + data.total + ' total</span></div>' + filter + '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>标签</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>');
+      S.view('<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span>' + data.total + ' total</span></div>' + filter + '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>标签</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>');
       bindFilters();
     } catch (err) {
       S.view(S.error(err, 'HME.renderMailboxes()'));
@@ -46,18 +49,22 @@
   function bindFilters(){
     const q = S.E('mailboxQ');
     const account = S.E('mailboxAccount');
+    const group = S.E('mailboxGroup');
     const status = S.E('mailboxStatus');
     if (q) q.addEventListener('input', () => S.debounce('mailboxSearch', applyFilters, 300));
     if (account) account.addEventListener('change', applyFilters);
+    if (group) group.addEventListener('change', applyFilters);
     if (status) status.addEventListener('change', applyFilters);
   }
   function applyFilters(){
     const qp = new URLSearchParams();
     const q = S.E('mailboxQ')?.value.trim();
     const account = S.E('mailboxAccount')?.value;
+    const group = S.E('mailboxGroup')?.value;
     const status = S.E('mailboxStatus')?.value;
     if (q) qp.set('q', q);
     if (account) qp.set('account', account);
+    if (group) qp.set('group_id', group);
     if (status) qp.set('status', status);
     S.navigate('#/mailboxes' + (qp.toString() ? '?' + qp.toString() : ''));
   }

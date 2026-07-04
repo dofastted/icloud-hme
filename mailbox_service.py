@@ -71,7 +71,7 @@ class MailboxService:
         self.index_path = Path(index_path)
 
     def list_mailboxes(
-        self, q: str = "", account_id: str = "", status: str = "", refresh: bool = False
+        self, q: str = "", account_id: str = "", group_id: str = "", status: str = "", refresh: bool = False
     ) -> List[Dict]:
         accounts = {a.get("id"): a for a in self.account_mgr.list_accounts()}
         by_alias: Dict[str, Dict] = {}
@@ -106,6 +106,8 @@ class MailboxService:
             ]
         if account_id:
             items = [item for item in items if item.get("account_id") == account_id]
+        if group_id:
+            items = [item for item in items if item.get("group_id") == group_id]
         if status:
             normalized = status.lower()
             if normalized in ("active", "enabled"):
@@ -313,6 +315,9 @@ class MailboxService:
             "account_id": source.get("account_id") or account.get("id", ""),
             "account_name": source.get("account_name") or account.get("name", ""),
             "label": source.get("label", ""),
+            "group_id": source.get("group_id") or account.get("group_id", ""),
+            "group_name": source.get("group_name") or account.get("group_name", ""),
+            "group_color": source.get("group_color") or account.get("group_color", ""),
             "is_active": bool(is_active),
             "created_at": source.get("createTimestamp") or source.get("createdAt") or source.get("created_at") or "",
             "shared": None,

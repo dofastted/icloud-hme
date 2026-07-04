@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
 import sys, os, json, time, queue, secrets, threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import wraps
+from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
@@ -18,6 +19,9 @@ from shared_mailboxes import SharedMailboxStore
 # ---- config ----
 RESULTS_DIR = HERE / "results"
 LOGS_DIR = HERE / "logs"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+SCHEDULER_WINDOW_START_HOUR = 7
+SCHEDULER_WINDOW_END_HOUR = 20
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,6 +84,12 @@ def _safe_account(account):
     safe["mail_port"] = int(account.get("mail_port") or 993)
     return safe
 
+def _list_groups_safe():
+    list_groups = getattr(_account_mgr, "list_groups", None)
+    if not callable(list_groups):
+        return []
+    return list_groups()
+
 class _RateLimiter:
     def __init__(self):
         self._hits = {}
@@ -109,6 +119,11 @@ def _paginate(items, default_limit=50, max_limit=100):
     limit = min(max(request.args.get("limit", default_limit, type=int), 1), max_limit)
     offset = max(request.args.get("offset", 0, type=int), 0)
     return items[offset:offset + limit], limit, offset
+
+def _optional_int(value):
+    if value in (None, ""):
+        return None
+    return int(value)
 
 def _shared_entry_url() -> str:
     exact = os.environ.get("SHARED_PUBLIC_URL", "").strip()
@@ -210,12 +225,27 @@ def _sync_time():
             if date_str:
                 from email.utils import parsedate_to_datetime
                 net_time = parsedate_to_datetime(date_str)
-                _time_offset = (net_time - datetime.now()).total_seconds()
+                current = datetime.now(net_time.tzinfo) if net_time.tzinfo else datetime.now()
+                _time_offset = (net_time - current).total_seconds()
                 return _time_offset
-        except: continue
+        except Exception:
+            continue
     return 0.0
 
 def _now() -> datetime: return datetime.now() + timedelta(seconds=_time_offset)
+
+def _beijing_now() -> datetime:
+    return (datetime.now(timezone.utc) + timedelta(seconds=_time_offset)).astimezone(BEIJING_TZ)
+
+def _scheduler_window_is_open(now: datetime | None = None) -> bool:
+    current = now or _beijing_now()
+    return SCHEDULER_WINDOW_START_HOUR <= current.hour < SCHEDULER_WINDOW_END_HOUR
+
+def _next_scheduler_window_start(now: datetime | None = None) -> datetime:
+    current = now or _beijing_now()
+    if current.hour < SCHEDULER_WINDOW_START_HOUR:
+        return current.replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    return (current + timedelta(days=1)).replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
 
 def _emit_log(level, msg): _log_queue.put({"time":_now().strftime("%H:%M:%S"),"level":level,"msg":msg})
 
@@ -248,16 +278,35 @@ def _refresh_scheduler_account_count(account: dict) -> dict:
     return account
 
 
+def _create_scheduled_alias(acc_id: str, acc_name: str) -> tuple[bool, str]:
+    label = f"{acc_name} {_beijing_now().strftime('%m%d%H%M')}"
+    results = _account_mgr.create_aliases_for_account(acc_id, count=1, label=label)
+    if not results:
+        return False, "create_aliases_for_account 返回空结果"
+    result = results[0]
+    email = result.get("email") or result.get("hme") or ""
+    if result.get("ok") and email:
+        return True, email
+    return False, str(result.get("error") or "create_alias 返回空邮箱")
+
+
+
 def _scheduler_loop():
     """后台调度器：北京时间 7:00-20:00，随机间隔 60-90min，每账号随机 3-5 个。"""
     import random as _random
-    from icloud_hme import ICloudHME
     _update_state(running=True, round_status="等待触发窗口")
     _emit_log("info", f"调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个，单账号达到 {SCHEDULER_ALIAS_LIMIT} 跳过)")
-    def _bj_hour() -> int: return (_now().hour + 8) % 24
     while not _stop_event.is_set():
-        h = _bj_hour()
-        if h < 7 or h >= 20: _update_state(round_status=f"非窗口时段 (BJ {h}:00)，等待..."); _stop_event.wait(1800); continue
+        bj_now = _beijing_now()
+        if not _scheduler_window_is_open(bj_now):
+            next_start = _next_scheduler_window_start(bj_now)
+            wait_sec = min(1800, max(1, int((next_start - bj_now).total_seconds())))
+            _update_state(
+                round_status=f"非窗口时段 (BJ {bj_now.hour}:00)，等待 {next_start.strftime('%m-%d %H:%M')}...",
+                next_trigger=next_start.timestamp(),
+            )
+            _stop_event.wait(wait_sec)
+            continue
         accounts = _account_mgr.list_accounts()
         active_accounts = scheduler_eligible_accounts(accounts)
         skipped = len([a for a in accounts if a.get("status") == "active" and account_reached_scheduler_limit(a)])
@@ -266,6 +315,7 @@ def _scheduler_loop():
             _stop_event.wait(1800)
             continue
         round_total = 0
+        round_note = ""
         for i, account in enumerate(active_accounts):
             if _stop_event.is_set(): break
             acc_id = account["id"]; acc_name = account.get("name", acc_id)
@@ -276,27 +326,28 @@ def _scheduler_loop():
             remaining = SCHEDULER_ALIAS_LIMIT - account_alias_total(account)
             target_count = min(_random.randint(3, 5), remaining)
             _emit_log("info", f"[{acc_name}] 本轮目标 {target_count} 个，当前 {account_alias_total(account)}/{SCHEDULER_ALIAS_LIMIT}")
-            client = ICloudHME(account["cookies"], host=account.get("host","icloud.com"), verbose=False)
             created = 0; errors = 0
             while created < target_count and errors < 3 and not _stop_event.is_set():
-                try:
-                    result = client.create_alias(label=f"{acc_name} {_now().strftime('%m%d%H%M')}", max_retries=2)
-                    email = result.get("email","")
-                    if email:
-                        created += 1; round_total += 1
-                        _emit_log("success", f"[{acc_name}] ({created}/{target_count}) {email}")
-                        _increment_state(today_created=1, total_created=1)
-                        with open(str(RESULTS_DIR/"latest_emails.txt"),"a",encoding="utf-8") as f: f.write(f"{email}\t{acc_id}\n")
-                        _account_mgr.update_account(acc_id, alias_total=account.get("alias_total",0)+1)
-                        account["alias_total"] = account.get("alias_total",0)+1
-                        errors = 0; time.sleep(_random.uniform(15,45))
-                    else: errors += 1
-                except Exception as e:
-                    err_str = str(e)
-                    if _is_limit_error(err_str): _emit_log("info",f"[{acc_name}] 触达上限: {err_str[:60]}"); break
-                    errors += 1; _emit_log("warn",f"[{acc_name}] 失败: {err_str[:80]}")
+                ok, message = _create_scheduled_alias(acc_id, acc_name)
+                if ok:
+                    created += 1; round_total += 1
+                    _emit_log("success", f"[{acc_name}] ({created}/{target_count}) {message}")
+                    _increment_state(today_created=1, total_created=1)
+                    account["alias_total"] = account.get("alias_total",0)+1
+                    account["alias_active"] = account.get("alias_active",0)+1
+                    errors = 0; time.sleep(_random.uniform(15,45))
+                    continue
+                errors += 1
+                if _is_limit_error(message):
+                    round_note = f"[{acc_name}] 触达创建限制: {message[:120]}"
+                    _update_state(last_error=round_note)
+                    _emit_log("info",f"[{acc_name}] 触达上限: {message[:60]}")
+                    break
+                _update_state(last_error=message[:300])
+                _emit_log("warn",f"[{acc_name}] 失败: {message[:80]}")
             if i < len(active_accounts)-1: time.sleep(_random.uniform(120,300))
-        _update_state(creating=False, current_round_created=round_total, round_status=f"本轮创建 {round_total} 个")
+        status = f"本轮创建 {round_total} 个" + (f"；{round_note}" if round_note else "")
+        _update_state(creating=False, current_round_created=round_total, round_status=status)
         interval_sec = _random.randint(3600,5400)
         target = _now() + timedelta(seconds=interval_sec)
         _update_state(next_trigger=target.timestamp())
@@ -347,7 +398,8 @@ def api_v1_accounts():
         item = _safe_account(account)
         item["has_cookies"] = bool(account.get("cookies"))
         accounts.append(item)
-    return jsonify({"ok":True,"accounts":accounts,"count":len(accounts)})
+    groups = _list_groups_safe()
+    return jsonify({"ok":True,"accounts":accounts,"count":len(accounts),"groups":groups})
 
 @app.route("/api/v1/accounts", methods=["POST"])
 @_require_api_key
@@ -360,6 +412,7 @@ def api_v1_add_account():
         data.get("name", "未命名账号"),
         cookie_input,
         data.get("host", "icloud.com"),
+        data.get("group_id", ""),
     )
     return jsonify({"ok":True,"account":_safe_account(account)})
 
@@ -540,6 +593,7 @@ def _mailbox_list_payload():
     items = _mailbox_service.list_mailboxes(
         q=request.args.get("q", ""),
         account_id=request.args.get("account_id", "") or request.args.get("account", ""),
+        group_id=request.args.get("group_id", "") or request.args.get("group", ""),
         status=request.args.get("status", ""),
         refresh=refresh,
     )
@@ -708,7 +762,60 @@ def api_accounts():
         ac = _safe_account(a)
         ac["has_cookies"] = bool(a.get("cookies"))
         safe.append(ac)
-    return jsonify({"accounts":safe,"count":len(safe)})
+    groups = _list_groups_safe()
+    return jsonify({"accounts":safe,"count":len(safe),"groups":groups})
+
+@app.route("/api/groups")
+def api_groups():
+    groups = _account_mgr.list_groups()
+    return jsonify({"ok":True,"groups":groups,"count":len(groups)})
+
+@app.route("/api/groups", methods=["POST"])
+def api_add_group():
+    data = request.get_json() or {}
+    group = _account_mgr.add_group(
+        data.get("name", ""),
+        data.get("description", ""),
+        data.get("color", ""),
+        _optional_int(data.get("sort_position")),
+    )
+    return jsonify({"ok":True,"group":group})
+
+@app.route("/api/groups/reorder", methods=["POST", "PUT"])
+def api_reorder_groups():
+    data = request.get_json() or {}
+    ok = _account_mgr.reorder_groups(data.get("group_ids", []))
+    return jsonify({"ok":ok})
+
+@app.route("/api/groups/<group_id>")
+def api_group_detail(group_id):
+    group = _account_mgr.get_group(group_id)
+    if not group:
+        return jsonify({"ok":False,"error":"分组不存在"}), 404
+    return jsonify({"ok":True,"group":group})
+
+@app.route("/api/groups/<group_id>", methods=["PUT"])
+def api_update_group(group_id):
+    data = request.get_json() or {}
+    group = _account_mgr.update_group(
+        group_id,
+        data.get("name", ""),
+        data.get("description", ""),
+        data.get("color", ""),
+        _optional_int(data.get("sort_position")),
+    )
+    return jsonify({"ok":True,"group":group})
+
+@app.route("/api/groups/<group_id>", methods=["DELETE"])
+def api_delete_group(group_id):
+    return jsonify({"ok":_account_mgr.delete_group(group_id)})
+
+@app.route("/api/accounts/batch-group", methods=["POST"])
+@app.route("/api/accounts/batch-update-group", methods=["POST"])
+def api_batch_update_group():
+    data = request.get_json() or {}
+    moved = _account_mgr.move_accounts_to_group(data.get("account_ids", []), data.get("group_id", ""))
+    return jsonify({"ok":True,"moved":moved})
 
 @app.route("/api/accounts/add", methods=["POST"])
 def api_add_account():
@@ -717,11 +824,49 @@ def api_add_account():
     cookie_input = data.get("cookie_input","")
     if not cookie_input: return jsonify({"ok":False,"error":"请提供 cookie_input"})
     try:
-        account = _account_mgr.add_account(name, cookie_input)
+        account = _account_mgr.add_account(
+            name,
+            cookie_input,
+            data.get("host", "icloud.com"),
+            data.get("group_id", ""),
+        )
         _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
-        return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status","")})
+        safe = _safe_account(account)
+        return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status",""),"account":safe,"group_id":account.get("group_id","")})
     except ValueError as e: return jsonify({"ok":False,"error":str(e)})
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/accounts/<acc_id>/session", methods=["GET"])
+def api_get_account_session(acc_id):
+    try:
+        return jsonify({"ok":True,"account":_account_mgr.get_account_session(acc_id)})
+    except KeyError as e:
+        return jsonify({"ok":False,"error":str(e).strip("'")}), 404
+
+@app.route("/api/accounts/<acc_id>/session", methods=["POST"])
+def api_update_account_session(acc_id):
+    data = request.get_json() or {}
+    cookie_input = data.get("cookie_input", "")
+    if not cookie_input:
+        return jsonify({"ok":False,"error":"请提供 cookie_input"})
+    try:
+        update_args = [
+            acc_id,
+            data.get("name", "未命名账号"),
+            cookie_input,
+            data.get("host", "icloud.com"),
+        ]
+        if "group_id" in data:
+            update_args.append(data.get("group_id"))
+        account = _account_mgr.update_account_session(*update_args)
+        _emit_log("info", f"更新账号会话: {account.get('name','')} ({account.get('real_email','?')})")
+        return jsonify({"ok":True,"account":_safe_account(account)})
+    except KeyError as e:
+        return jsonify({"ok":False,"error":str(e).strip("'")}), 404
+    except ValueError as e:
+        return jsonify({"ok":False,"error":str(e)})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/accounts/<acc_id>/remove", methods=["POST"])
 def api_remove_account(acc_id):
