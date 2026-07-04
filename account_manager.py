@@ -108,6 +108,7 @@ class AccountManager:
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
         self.groups: Dict[str, Dict] = {}
+        self.mailbox_groups: Dict[str, str] = {}
         self._lock = threading.RLock()
         self._cache = get_cache()
         self._load()
@@ -132,10 +133,12 @@ class AccountManager:
                     }
                 elif isinstance(groups, dict):
                     self.groups = groups
+                mailbox_groups = data.get("mailbox_groups", {})
+                self.mailbox_groups = mailbox_groups if isinstance(mailbox_groups, dict) else {}
             except (json.JSONDecodeError, OSError):
                 self.accounts = {}
                 self.groups = {}
-
+                self.mailbox_groups = {}
         changed = self._normalize_loaded_state()
         if changed:
             self._save()
@@ -147,6 +150,7 @@ class AccountManager:
                 json.dumps({
                     "accounts": self.accounts,
                     "groups": self.groups,
+                    "mailbox_groups": self.mailbox_groups,
                     "updated_at": datetime.now().isoformat(),
                 }, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -170,7 +174,6 @@ class AccountManager:
             "status": "active",
             "alias_total": 0,
             "alias_active": 0,
-            "group_id": DEFAULT_GROUP_ID,
             "last_validated": None,
             "last_error": None,
             "created_at": datetime.now().isoformat(),
@@ -255,9 +258,28 @@ class AccountManager:
             default["sort_order"] = 0
             changed = True
 
+        if not isinstance(self.mailbox_groups, dict):
+            self.mailbox_groups = {}
+            changed = True
+
+        for raw_alias, raw_group_id in list(self.mailbox_groups.items()):
+            alias = self._normalize_mailbox_email(raw_alias)
+            gid = str(raw_group_id or "").strip()
+            if not alias or gid not in self.groups or gid == DEFAULT_GROUP_ID:
+                del self.mailbox_groups[raw_alias]
+                changed = True
+                continue
+            if alias != raw_alias:
+                del self.mailbox_groups[raw_alias]
+                self.mailbox_groups[alias] = gid
+                changed = True
+            elif self.mailbox_groups[raw_alias] != gid:
+                self.mailbox_groups[raw_alias] = gid
+                changed = True
+
         for account in self.accounts.values():
-            if account.get("group_id") not in self.groups:
-                account["group_id"] = DEFAULT_GROUP_ID
+            if "group_id" in account:
+                del account["group_id"]
                 changed = True
 
         return changed
@@ -270,14 +292,39 @@ class AccountManager:
             raise ValueError("分组不存在")
         return gid
 
-    def _account_with_group(self, account: Dict) -> Dict:
-        item = dict(account)
-        gid = item.get("group_id") if item.get("group_id") in self.groups else DEFAULT_GROUP_ID
-        group = self.groups.get(gid, self.groups[DEFAULT_GROUP_ID])
-        item["group_id"] = gid
-        item["group_name"] = group.get("name", "")
-        item["group_color"] = group.get("color", "")
-        return item
+    @staticmethod
+    def _normalize_mailbox_email(alias_email: Any) -> str:
+        return str(alias_email or "").strip().lower()
+
+    def _group_for_id(self, group_id: str) -> Dict:
+        gid = group_id if group_id in self.groups else DEFAULT_GROUP_ID
+        return dict(self.groups.get(gid, self.groups[DEFAULT_GROUP_ID]))
+
+    def get_mailbox_group(self, alias_email: str) -> Dict:
+        self._normalize_loaded_state()
+        alias = self._normalize_mailbox_email(alias_email)
+        gid = self.mailbox_groups.get(alias, DEFAULT_GROUP_ID)
+        return self._group_for_id(gid)
+
+    def move_mailboxes_to_group(self, alias_emails: List[str], group_id: str) -> int:
+        gid = self._group_id_from_input(group_id)
+        moved = 0
+        with self._lock:
+            for alias_email in alias_emails:
+                alias = self._normalize_mailbox_email(alias_email)
+                if not alias or "@" not in alias:
+                    continue
+                if gid == DEFAULT_GROUP_ID:
+                    if alias in self.mailbox_groups:
+                        del self.mailbox_groups[alias]
+                        moved += 1
+                    continue
+                if self.mailbox_groups.get(alias) != gid:
+                    self.mailbox_groups[alias] = gid
+                    moved += 1
+            if moved:
+                self._save()
+        return moved
 
     def _movable_group_ids(self, exclude_group_id: Optional[str] = None) -> List[str]:
         return [
@@ -308,8 +355,7 @@ class AccountManager:
     def list_groups(self) -> List[Dict]:
         self._normalize_loaded_state()
         counts: Dict[str, int] = {gid: 0 for gid in self.groups}
-        for account in self.accounts.values():
-            gid = account.get("group_id") if account.get("group_id") in self.groups else DEFAULT_GROUP_ID
+        for gid in self.mailbox_groups.values():
             counts[gid] = counts.get(gid, 0) + 1
         groups = sorted(
             self.groups.values(),
@@ -318,7 +364,7 @@ class AccountManager:
         result = []
         for group in groups:
             item = dict(group)
-            item["account_count"] = counts.get(group["id"], 0)
+            item["mailbox_count"] = counts.get(group["id"], 0)
             result.append(item)
         return result
 
@@ -327,7 +373,7 @@ class AccountManager:
         if not group:
             return None
         item = dict(group)
-        item["account_count"] = sum(1 for a in self.accounts.values() if a.get("group_id") == item["id"])
+        item["mailbox_count"] = sum(1 for gid in self.mailbox_groups.values() if gid == item["id"])
         return item
 
     def add_group(self, name: str, description: str = "", color: str = "", sort_position: Optional[int] = None) -> Dict:
@@ -380,9 +426,11 @@ class AccountManager:
         if gid not in self.groups:
             raise KeyError("分组不存在")
         with self._lock:
-            for account in self.accounts.values():
-                if account.get("group_id") == gid:
-                    account["group_id"] = DEFAULT_GROUP_ID
+            self.mailbox_groups = {
+                alias: assigned_gid
+                for alias, assigned_gid in self.mailbox_groups.items()
+                if assigned_gid != gid
+            }
             del self.groups[gid]
             self._apply_group_order(self._movable_group_ids())
             self._save()
@@ -398,18 +446,6 @@ class AccountManager:
             self._save()
         return True
 
-    def move_accounts_to_group(self, account_ids: List[str], group_id: str) -> int:
-        gid = self._group_id_from_input(group_id)
-        moved = 0
-        with self._lock:
-            for acc_id in account_ids:
-                account = self.accounts.get(str(acc_id or "").strip())
-                if account:
-                    account["group_id"] = gid
-                    moved += 1
-            if moved:
-                self._save()
-        return moved
 
     @staticmethod
     def _account_identity_values(account: Dict) -> set[str]:
@@ -507,7 +543,6 @@ class AccountManager:
     ) -> Dict:
         cookies = self.parse_cookie_input(cookie_input)
         acc_id = self._generate_id()
-        requested_group_id = self._group_id_from_input(group_id)
 
         account: Dict[str, Any] = {
             "id": acc_id,
@@ -519,7 +554,6 @@ class AccountManager:
             "status": "active",
             "alias_total": 0,
             "alias_active": 0,
-            "group_id": requested_group_id,
             "last_validated": None,
             "last_error": None,
             "created_at": datetime.now().isoformat(),
@@ -532,8 +566,6 @@ class AccountManager:
                 account["id"] = duplicate["id"]
                 account["name"] = duplicate.get("name") or account["name"]
                 account["created_at"] = duplicate.get("created_at") or account["created_at"]
-                if not str(group_id or "").strip():
-                    account["group_id"] = duplicate.get("group_id") or DEFAULT_GROUP_ID
                 for key in ("mail_email", "mail_password", "mail_host", "mail_port"):
                     if duplicate.get(key) and not account.get(key):
                         account[key] = duplicate[key]
@@ -541,23 +573,19 @@ class AccountManager:
             else:
                 self.accounts[acc_id] = account
             self._save()
-        return self._account_with_group(account)
+        return dict(account)
 
     def get_account_session(self, acc_id: str) -> Dict:
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
-        item = self._account_with_group(account)
         return {
-            "id": item.get("id", acc_id),
-            "name": item.get("name", ""),
-            "real_email": item.get("real_email", ""),
-            "host": item.get("host", "icloud.com"),
-            "status": item.get("status", ""),
-            "group_id": item.get("group_id", DEFAULT_GROUP_ID),
-            "group_name": item.get("group_name", ""),
-            "group_color": item.get("group_color", ""),
-            "cookie_input": self.cookies_to_header(item.get("cookies", {})),
+            "id": account.get("id", acc_id),
+            "name": account.get("name", ""),
+            "real_email": account.get("real_email", ""),
+            "host": account.get("host", "icloud.com"),
+            "status": account.get("status", ""),
+            "cookie_input": self.cookies_to_header(account.get("cookies", {})),
         }
 
     def update_account_session(
@@ -576,8 +604,7 @@ class AccountManager:
             "cookies": cookies,
             "host": str(host or account.get("host") or "icloud.com").strip() or "icloud.com",
         })
-        if group_id is not None:
-            account["group_id"] = self._group_id_from_input(group_id, account.get("group_id") or DEFAULT_GROUP_ID)
+        account.pop("group_id", None)
         self._refresh_session_state(account)
 
         with self._lock:
@@ -589,7 +616,7 @@ class AccountManager:
                 raise ValueError(f"该会话属于已存在账号: {label}")
             self.accounts[acc_id] = account
             self._save()
-            return self._account_with_group(account)
+            return dict(account)
 
     def remove_account(self, acc_id: str) -> bool:
         if acc_id in self.accounts:
@@ -602,22 +629,21 @@ class AccountManager:
         account = self.accounts.get(acc_id)
         if not account:
             return None
-        return self._account_with_group(account)
+        return dict(account)
 
     def list_accounts(self) -> List[Dict]:
         return sorted(
-            (self._account_with_group(account) for account in self.accounts.values()),
+            (dict(account) for account in self.accounts.values()),
             key=lambda a: (a.get("status") != "active", a.get("created_at", "")),
         )
 
     def update_account(self, acc_id: str, **kwargs) -> Optional[Dict]:
         with self._lock:
             if acc_id in self.accounts:
-                if "group_id" in kwargs:
-                    kwargs["group_id"] = self._group_id_from_input(kwargs["group_id"])
+                kwargs.pop("group_id", None)
                 self.accounts[acc_id].update(kwargs)
                 self._save()
-                return self._account_with_group(self.accounts[acc_id])
+                return dict(self.accounts[acc_id])
             return None
 
     @staticmethod
@@ -994,14 +1020,15 @@ class AccountManager:
     def get_all_aliases(self) -> List[Dict]:
         all_aliases: List[Dict] = []
         for acc_id, account in self.accounts.items():
-            account_with_group = self._account_with_group(account)
             for alias in self.get_aliases_for_account(acc_id):
+                alias_email = alias.get("email") or alias.get("hme") or ""
+                group = self.get_mailbox_group(alias_email)
                 alias["account_id"] = acc_id
                 alias["account_name"] = account.get("name", "")
                 alias["account_email"] = account.get("real_email", "")
-                alias["group_id"] = account_with_group.get("group_id", DEFAULT_GROUP_ID)
-                alias["group_name"] = account_with_group.get("group_name", "")
-                alias["group_color"] = account_with_group.get("group_color", "")
+                alias["group_id"] = group.get("id", DEFAULT_GROUP_ID)
+                alias["group_name"] = group.get("name", "")
+                alias["group_color"] = group.get("color", "")
                 all_aliases.append(alias)
         return all_aliases
 

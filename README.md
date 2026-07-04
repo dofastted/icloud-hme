@@ -41,11 +41,11 @@ python web_ui.py --scheduler        # 启动 Web 后自动开启调度器
 
 | 模块 | 功能 |
 |------|------|
-| **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话，支持选择所属分组 |
-| **分组管理** | 创建/编辑/删除账号分组，自定义颜色，删除分组时账号回到默认分组 |
+| **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话 |
+| **邮箱分组** | 创建/编辑/删除 HME 邮箱分组，自定义颜色，删除分组时邮箱回到默认分组 |
 | **仪表盘** | 账号总数、总别名数、今日创建数，每账号一张状态卡片 |
-| **别名列表** | 实时拉取所有别名，标注所属账号、真实邮箱和分组 |
-| **邮箱详情** | 搜索单个 HME 邮箱，查看最新邮件，按需展开正文 |
+| **别名列表** | 实时拉取所有别名，标注所属账号和邮箱分组，支持按分组筛选与移动 |
+| **邮箱详情** | 搜索单个 HME 邮箱，查看最新邮件，按需移动分组或展开正文 |
 | **共享管理** | 为单个 HME 邮箱生成/吊销公网只读 shared 链接 |
 | **批量创建** | 勾选目标账号 → 输入数量 → 跨账号轮询创建 |
 | **调度器** | 一键启停，自动遍历活跃账号；单账号达到 750 个 HME 后跳过调度 |
@@ -114,7 +114,7 @@ curl -X POST http://127.0.0.1:5050/api/keys \
 | `GET` | `/api/v1/config` | 主配置入口：返回 API base、鉴权方式、可用入口和 shared 主入口 |
 | `GET` | `/api/v1/hme/available` | 用一把 API Key 全局列出可用 HME，跨账号聚合 |
 | `GET` | `/api/v1/hme/available/next?include_latest=1` | 返回一个可用 HME，可选带最新邮件 |
-| `GET` | `/api/v1/accounts` | 列出账号与分组摘要，账号字段已脱敏 |
+| `GET` | `/api/v1/accounts` | 列出账号，账号字段已脱敏，响应附带邮箱分组摘要 |
 | `GET` | `/api/v1/hme/{alias}/latest?force=0` | 通过一把 API Key 全局读取指定 HME 最新邮件 |
 | `POST` | `/api/v1/accounts` | 导入 Cookie 并校验 iCloud 会话 |
 | `POST` | `/api/v1/accounts/{id}/session/validate` | 重新校验登录会话 |
@@ -124,7 +124,7 @@ curl -X POST http://127.0.0.1:5050/api/keys \
 | `GET` | `/api/v1/accounts/{id}/aliases` | 列出别名，字段对齐 Apple HME |
 | `POST` | `/api/v1/accounts/{id}/aliases/{anonymousId}/deactivate` | 停用别名 |
 | `DELETE` | `/api/v1/accounts/{id}/aliases/{anonymousId}` | 删除别名 |
-| `GET` | `/api/v1/mailboxes?q=&account_id=&group_id=&status=` | 搜索/列出全部 HME 邮箱，可按账号或分组过滤 |
+| `GET` | `/api/v1/mailboxes?q=&account_id=&group_id=&status=` | 搜索/列出全部 HME 邮箱，可按账号或邮箱分组过滤 |
 | `GET` | `/api/v1/mailboxes/search?q=xxx` | 邮箱搜索快捷入口 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages?limit=1` | 读取指定 HME 邮箱邮件，默认最新一封 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages/{message_id}` | 读取指定邮件正文详情 |
@@ -239,7 +239,7 @@ curl -X POST http://127.0.0.1:5050/api/shared/latest \
 运行时生成：
 
 ```
-accounts.json          # 所有账号、分组及 Cookie（自动持久化）
+accounts.json          # 所有账号、邮箱分组、邮箱-分组映射及 Cookie（自动持久化）
 shared_mailboxes.json  # shared key 摘要、prefix、访问统计
 scheduler_state.json   # 调度器历史状态
 logs/                  # 运行日志

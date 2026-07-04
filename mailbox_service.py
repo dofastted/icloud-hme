@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from account_manager import AccountManager, LATEST_EMAILS
+from account_manager import AccountManager, LATEST_EMAILS, DEFAULT_GROUP_ID, DEFAULT_GROUP_NAME, DEFAULT_GROUP_COLOR
 from shared_mailboxes import SharedMailboxStore
 
 MAILBOX_INDEX_FILE = LATEST_EMAILS.parent / "mailbox_index.json"
@@ -308,16 +308,35 @@ class MailboxService:
                 merged[key] = value
         by_alias[alias] = merged
 
+    def _mailbox_group_fields(self, alias: str, source: Dict) -> Dict:
+        getter = getattr(self.account_mgr, "get_mailbox_group", None)
+        if callable(getter):
+            try:
+                group = getter(alias)
+                return {
+                    "group_id": group.get("id", DEFAULT_GROUP_ID),
+                    "group_name": group.get("name", DEFAULT_GROUP_NAME),
+                    "group_color": group.get("color", DEFAULT_GROUP_COLOR),
+                }
+            except Exception:
+                pass
+
+        group_id = source.get("group_id") or DEFAULT_GROUP_ID
+        return {
+            "group_id": group_id,
+            "group_name": source.get("group_name") or (DEFAULT_GROUP_NAME if group_id == DEFAULT_GROUP_ID else ""),
+            "group_color": source.get("group_color") or (DEFAULT_GROUP_COLOR if group_id == DEFAULT_GROUP_ID else ""),
+        }
+
     def _summary_from_parts(self, alias: str, account: Dict, source: Dict) -> Dict:
         is_active = source.get("isActive", source.get("active", source.get("is_active", True)))
+        group_fields = self._mailbox_group_fields(alias, source)
         return {
             "alias_email": alias,
             "account_id": source.get("account_id") or account.get("id", ""),
             "account_name": source.get("account_name") or account.get("name", ""),
             "label": source.get("label", ""),
-            "group_id": source.get("group_id") or account.get("group_id", ""),
-            "group_name": source.get("group_name") or account.get("group_name", ""),
-            "group_color": source.get("group_color") or account.get("group_color", ""),
+            **group_fields,
             "is_active": bool(is_active),
             "created_at": source.get("createTimestamp") or source.get("createdAt") or source.get("created_at") or "",
             "shared": None,

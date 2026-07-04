@@ -15,10 +15,10 @@
         const color = S.esc(g.color || '#1f8b4c');
         const badge = '<span class="badge" style="border-color:' + color + '">' + name + '</span>';
         const actions = g.is_default ? '<span class="muted">默认分组</span>' : '<button class="btn btn-outline btn-sm" onclick="HME.showGroupModal(' + idArg + ')">编辑</button> <button class="btn btn-danger btn-sm" onclick="HME.deleteGroup(' + idArg + ')">删除</button>';
-        return '<tr><td>' + (i + 1) + '</td><td>' + badge + '</td><td>' + S.esc(g.description || '') + '</td><td>' + (g.account_count || 0) + '</td><td>' + (g.sort_order || 0) + '</td><td>' + actions + '</td></tr>';
+        return '<tr><td>' + (i + 1) + '</td><td>' + badge + '</td><td>' + S.esc(g.description || '') + '</td><td>' + (g.mailbox_count || 0) + '</td><td>' + (g.sort_order || 0) + '</td><td>' + actions + '</td></tr>';
       }).join('');
       const body = rows || '<tr><td colspan="6" class="muted">暂无分组</td></tr>';
-      S.view('<div class="panel"><div class="panel-head"><span>分组管理</span><button class="btn btn-sm" onclick="HME.showGroupModal()">新建分组</button></div><div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>分组</th><th>说明</th><th>账号数</th><th>排序</th><th>操作</th></tr></thead><tbody>' + body + '</tbody></table></div></div>');
+      S.view('<div class="panel"><div class="panel-head"><span>邮箱分组管理</span><button class="btn btn-sm" onclick="HME.showGroupModal()">新建分组</button></div><div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>分组</th><th>说明</th><th>邮箱数</th><th>排序</th><th>操作</th></tr></thead><tbody>' + body + '</tbody></table></div></div>');
     } catch (err) {
       S.view(S.error(err, 'HME.renderGroups()'));
     }
@@ -49,7 +49,7 @@
   };
 
   S.deleteGroup = async function(id){
-    if (!confirm('确认删除该分组？分组内账号会移至默认分组。')) return;
+    if (!confirm('确认删除该分组？分组内邮箱会移至默认分组。')) return;
     try {
       await S.api('/api/groups/' + encodeURIComponent(id), {method:'DELETE'});
       S.toast('分组已删除');

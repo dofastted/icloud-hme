@@ -63,7 +63,7 @@ curl -X POST "$BASE_URL/api/keys/key_xxx/revoke" \
 | `GET` | `/api/v1/hme/available/next` | 取一个可用 HME |
 | `GET` | `/api/v1/hme/{alias_email}/latest` | 读取指定 HME 最新邮件 |
 | `POST` | `/api/v1/accounts` | 导入账号 Cookie |
-| `GET` | `/api/v1/accounts` | 列出账号和分组摘要 |
+| `GET` | `/api/v1/accounts` | 列出账号；响应附带邮箱分组摘要 |
 | `POST` | `/api/v1/accounts/{id}/session/validate` | 校验账号会话 |
 | `POST` | `/api/v1/accounts/{id}/mail-settings` | 配置接收邮箱邮件登录 |
 | `GET` | `/api/v1/accounts/{id}/aliases` | 列出账号别名 |
@@ -372,7 +372,7 @@ GET /api/v1/mailboxes/search?q=login
 |------|------|
 | `q` | 邮箱、标签、账号名搜索 |
 | `account_id` 或 `account` | 限定账号 |
-| `group_id` 或 `group` | 限定账号分组 |
+| `group_id` 或 `group` | 限定邮箱分组 |
 | `status` | 限定状态 |
 | `limit` | 默认 50，最大 100 |
 | `offset` | 分页偏移 |
@@ -523,14 +523,14 @@ GET /api/shared/<redemption_code>/latest?force=0
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/api/state` | 当前运行状态、账号和别名统计 |
-| `GET` | `/api/accounts` | 本地账号列表和分组摘要，敏感字段已过滤 |
-| `POST` | `/api/accounts/add` | 导入账号 Cookie，可传 `group_id` |
-| `GET` | `/api/groups` | 获取本地分组列表 |
-| `POST` | `/api/groups` | 创建分组 |
-| `PUT` | `/api/groups/{id}` | 更新分组 |
-| `DELETE` | `/api/groups/{id}` | 删除分组，账号回到默认分组 |
+| `GET` | `/api/accounts` | 本地账号列表和邮箱分组摘要，敏感字段已过滤 |
+| `POST` | `/api/accounts/add` | 导入账号 Cookie |
+| `GET` | `/api/groups` | 获取本地邮箱分组列表 |
+| `POST` | `/api/groups` | 创建邮箱分组 |
+| `PUT` | `/api/groups/{id}` | 更新邮箱分组 |
+| `DELETE` | `/api/groups/{id}` | 删除邮箱分组，邮箱回到默认分组 |
 | `PUT` | `/api/groups/reorder` | 调整自定义分组顺序 |
-| `POST` | `/api/accounts/batch-update-group` | 批量移动账号到指定分组 |
+| `POST` | `/api/mailboxes/batch-update-group` | 批量移动 HME 邮箱到指定分组 |
 | `POST` | `/api/accounts/{id}/remove` | 删除账号 |
 | `POST` | `/api/accounts/{id}/validate` | 校验账号会话 |
 | `POST` | `/api/accounts/{id}/create` | 单账号创建 HME |

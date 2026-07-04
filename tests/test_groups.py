@@ -4,7 +4,7 @@ import types
 
 import account_manager
 import web_ui
-from account_manager import AccountManager
+from account_manager import AccountManager, DEFAULT_GROUP_COLOR, DEFAULT_GROUP_ID
 from mailbox_service import MailboxService
 from shared_mailboxes import SharedMailboxStore
 
@@ -27,24 +27,21 @@ class FakeHME:
         return []
 
 
-class GroupAwareFakeManager:
+class MailboxGroupFakeManager:
     def __init__(self):
         self._cache = None
+        self.groups = {
+            "grp_default": {"id": "grp_default", "name": "默认分组", "color": "#1f8b4c"},
+            "grp_work": {"id": "grp_work", "name": "Work", "color": "#123456"},
+            "grp_personal": {"id": "grp_personal", "name": "Personal", "color": "#654321"},
+        }
+        self.mailbox_groups = {
+            "work@icloud.com": "grp_work",
+            "home@icloud.com": "grp_personal",
+        }
         self.accounts = [
-            {
-                "id": "acc_work",
-                "name": "Work Account",
-                "group_id": "grp_work",
-                "group_name": "Work",
-                "group_color": "#123456",
-            },
-            {
-                "id": "acc_personal",
-                "name": "Personal Account",
-                "group_id": "grp_personal",
-                "group_name": "Personal",
-                "group_color": "#654321",
-            },
+            {"id": "acc_work", "name": "Work Account"},
+            {"id": "acc_personal", "name": "Personal Account"},
         ]
 
     def list_accounts(self):
@@ -52,6 +49,10 @@ class GroupAwareFakeManager:
 
     def get_all_aliases(self):
         return []
+
+    def get_mailbox_group(self, alias_email):
+        gid = self.mailbox_groups.get(str(alias_email).lower(), "grp_default")
+        return dict(self.groups[gid])
 
 
 def patch_account_files(monkeypatch, tmp_path):
@@ -61,12 +62,9 @@ def patch_account_files(monkeypatch, tmp_path):
     monkeypatch.setattr(account_manager, "LATEST_EMAILS", tmp_path / "results" / "latest_emails.txt")
 
 
-def seed_accounts_file(tmp_path, accounts):
+def seed_accounts_file(tmp_path, payload):
     path = tmp_path / "accounts.json"
-    path.write_text(
-        json.dumps({"accounts": accounts, "updated_at": "2024-01-01T00:00:00"}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
 
 
@@ -81,18 +79,37 @@ def group_ids(manager):
     return [group["id"] for group in manager.list_groups()]
 
 
-def test_legacy_accounts_file_gets_default_group_and_is_persisted(monkeypatch, tmp_path):
+def test_legacy_accounts_file_gets_default_group_and_mailbox_mapping(monkeypatch, tmp_path):
     patch_account_files(monkeypatch, tmp_path)
     accounts_path = seed_accounts_file(
         tmp_path,
         {
-            "acc_legacy": {
-                "id": "acc_legacy",
-                "name": "Legacy Account",
-                "cookies": {"SESSION": "secret"},
-                "status": "active",
-                "created_at": "2024-01-01T00:00:00",
-            }
+            "accounts": {
+                "acc_legacy": {
+                    "id": "acc_legacy",
+                    "name": "Legacy Account",
+                    "cookies": {"SESSION": "secret"},
+                    "status": "active",
+                    "group_id": "grp_wrong_account_group",
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            },
+            "groups": {
+                "grp_vip": {
+                    "id": "grp_vip",
+                    "name": "VIP",
+                    "color": "#123456",
+                    "sort_order": 1,
+                    "is_default": False,
+                    "created_at": "2024-01-01T00:00:00",
+                }
+            },
+            "mailbox_groups": {
+                "VIP@ICLOUD.COM": "grp_vip",
+                "missing@icloud.com": "grp_missing",
+                "default@icloud.com": DEFAULT_GROUP_ID,
+            },
+            "updated_at": "2024-01-01T00:00:00",
         },
     )
 
@@ -100,20 +117,25 @@ def test_legacy_accounts_file_gets_default_group_and_is_persisted(monkeypatch, t
     default = default_group(manager)
 
     account = manager.get_account("acc_legacy")
-    assert account["group_id"] == default["id"]
+    assert "group_id" not in account
+    assert manager.get_mailbox_group("vip@icloud.com")["id"] == "grp_vip"
+    assert manager.get_mailbox_group("missing@icloud.com")["id"] == default["id"]
 
     saved = json.loads(accounts_path.read_text(encoding="utf-8"))
-    assert saved["accounts"]["acc_legacy"]["group_id"] == default["id"]
+    assert "group_id" not in saved["accounts"]["acc_legacy"]
+    assert saved["mailbox_groups"] == {"vip@icloud.com": "grp_vip"}
     assert any(group.get("is_default") is True for group in saved["groups"].values())
 
 
-def test_account_manager_group_lifecycle_reorder_move_and_delete_fallback(monkeypatch, tmp_path):
+def test_account_manager_group_lifecycle_reorder_mailbox_move_and_delete(monkeypatch, tmp_path):
     patch_account_files(monkeypatch, tmp_path)
     seed_accounts_file(
         tmp_path,
         {
-            "acc_one": {"id": "acc_one", "name": "One", "cookies": {}, "status": "active"},
-            "acc_two": {"id": "acc_two", "name": "Two", "cookies": {}, "status": "active"},
+            "accounts": {
+                "acc_one": {"id": "acc_one", "name": "One", "cookies": {}, "status": "active"},
+                "acc_two": {"id": "acc_two", "name": "Two", "cookies": {}, "status": "active"},
+            }
         },
     )
     manager = AccountManager()
@@ -122,22 +144,23 @@ def test_account_manager_group_lifecycle_reorder_move_and_delete_fallback(monkey
     vip = manager.add_group(name="VIP", color="#ff0000")
     cold = manager.add_group(name="Cold", color="#00ff00")
 
-    updated = manager.update_group(vip["id"], name="Important", color="#123456")
+    updated = manager.update_group(vip["id"], name="Important", color="not-a-color")
     assert updated["name"] == "Important"
-    assert updated["color"] == "#123456"
+    assert updated["color"] == DEFAULT_GROUP_COLOR
 
-    moved = manager.move_accounts_to_group(["acc_one", "acc_two"], vip["id"])
+    moved = manager.move_mailboxes_to_group(["One@iCloud.com", "two@icloud.com"], vip["id"])
     assert moved == 2
-    assert manager.get_account("acc_one")["group_id"] == vip["id"]
-    assert manager.get_account("acc_two")["group_id"] == vip["id"]
+    assert manager.get_mailbox_group("one@icloud.com")["id"] == vip["id"]
+    assert manager.get_mailbox_group("two@icloud.com")["id"] == vip["id"]
+    assert manager.get_group(vip["id"])["mailbox_count"] == 2
 
     manager.reorder_groups([cold["id"], vip["id"]])
     ordered_custom_ids = [gid for gid in group_ids(manager) if gid != default["id"]]
     assert ordered_custom_ids[:2] == [cold["id"], vip["id"]]
 
     assert manager.delete_group(vip["id"]) is True
-    assert manager.get_account("acc_one")["group_id"] == default["id"]
-    assert manager.get_account("acc_two")["group_id"] == default["id"]
+    assert manager.get_mailbox_group("one@icloud.com")["id"] == default["id"]
+    assert manager.get_mailbox_group("two@icloud.com")["id"] == default["id"]
     assert vip["id"] not in group_ids(manager)
 
 
@@ -145,6 +168,8 @@ def configure_web_ui(monkeypatch, tmp_path):
     patch_account_files(monkeypatch, tmp_path)
     monkeypatch.setitem(sys.modules, "icloud_hme", types.SimpleNamespace(ICloudHME=FakeHME))
     manager = AccountManager()
+    manager.accounts["acc_1"] = {"id": "acc_1", "name": "Main", "cookies": {}, "status": "active"}
+    manager._save()
     store = SharedMailboxStore(tmp_path / "shared.json")
     service = MailboxService(
         manager,
@@ -155,24 +180,37 @@ def configure_web_ui(monkeypatch, tmp_path):
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
     monkeypatch.setattr(web_ui, "_shared_store", store)
     monkeypatch.setattr(web_ui, "_mailbox_service", service)
-    return web_ui.app.test_client(), manager
+    return web_ui.app.test_client(), manager, service.index_path
 
 
-def test_api_groups_crud_accounts_group_fields_and_account_group_updates(monkeypatch, tmp_path):
-    client, manager = configure_web_ui(monkeypatch, tmp_path)
+def test_api_groups_crud_mailbox_group_updates_and_account_sanitizing(monkeypatch, tmp_path):
+    client, manager, index_path = configure_web_ui(monkeypatch, tmp_path)
+    index_path.write_text(
+        json.dumps(
+            {
+                "mailboxes": {
+                    "work@icloud.com": {
+                        "alias_email": "work@icloud.com",
+                        "account_id": "acc_1",
+                        "label": "Work Alias",
+                        "is_active": True,
+                        "created_at": "2024-01-02T00:00:00",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     initial = client.get("/api/groups")
     assert initial.status_code == 200
-    initial_data = initial.get_json()
-    assert initial_data["ok"] is True
-    default = next(group for group in initial_data["groups"] if group.get("is_default") is True)
+    assert initial.get_json()["ok"] is True
+    default = next(group for group in initial.get_json()["groups"] if group.get("is_default") is True)
 
     created = client.post("/api/groups", json={"name": "VIP", "color": "#123456"})
     assert created.status_code == 200
-    created_data = created.get_json()
-    assert created_data["ok"] is True
-    vip_id = created_data["group"]["id"]
-
+    vip_id = created.get_json()["group"]["id"]
     cold = client.post("/api/groups", json={"name": "Cold", "color": "#654321"}).get_json()["group"]
 
     updated = client.put(f"/api/groups/{vip_id}", json={"name": "Important", "color": "#abcdef"})
@@ -183,45 +221,41 @@ def test_api_groups_crud_accounts_group_fields_and_account_group_updates(monkeyp
     assert reordered.status_code == 200
     assert reordered.get_json()["ok"] is True
 
+    moved = client.post(
+        "/api/mailboxes/batch-update-group",
+        json={"alias_emails": ["work@icloud.com"], "group_id": vip_id},
+    )
+    assert moved.status_code == 200
+    assert moved.get_json()["moved"] == 1
+
+    listed = client.get(f"/api/mailboxes?group_id={vip_id}").get_json()["mailboxes"]
+    assert [item["alias_email"] for item in listed] == ["work@icloud.com"]
+    assert listed[0]["group_id"] == vip_id
+    assert listed[0]["group_name"] == "Important"
+    assert listed[0]["group_color"] == "#abcdef"
+
+    group_counts = client.get("/api/groups").get_json()["groups"]
+    assert next(group for group in group_counts if group["id"] == vip_id)["mailbox_count"] == 1
+
     added = client.post(
         "/api/accounts/add",
         json={"name": "Grouped", "cookie_input": "A=1", "group_id": vip_id},
     )
     assert added.status_code == 200
-    added_data = added.get_json()
-    assert added_data["ok"] is True
-    account = added_data["account"]
-    assert account["group_id"] == vip_id
-    assert account["group_name"] == "Important"
-    assert account["group_color"] == "#abcdef"
+    account = added.get_json()["account"]
+    assert "group_id" not in account
+    assert "group_name" not in account
     assert "cookies" not in account
     assert "mail_password" not in account
 
-    manager.update_account(account["id"], cookies={"SESSION": "secret"}, mail_password="secret", app_password="legacy")
-    accounts_data = client.get("/api/accounts").get_json()
-    assert [group["id"] for group in accounts_data["groups"]] == group_ids(manager)
-    listed = next(item for item in accounts_data["accounts"] if item["id"] == account["id"])
-    assert listed["group_id"] == vip_id
-    assert listed["group_name"] == "Important"
-    assert listed["group_color"] == "#abcdef"
-    assert "cookies" not in listed
-    assert "mail_password" not in listed
-    assert "app_password" not in listed
-
-    edited = client.post(
-        f"/api/accounts/{account['id']}/session",
-        json={"name": "Regrouped", "cookie_input": "B=2", "host": "icloud.com", "group_id": cold["id"]},
-    )
-    assert edited.status_code == 200
-    assert edited.get_json()["account"]["group_id"] == cold["id"]
-
-    deleted = client.delete(f"/api/groups/{cold['id']}")
+    deleted = client.delete(f"/api/groups/{vip_id}")
     assert deleted.status_code == 200
     assert deleted.get_json()["ok"] is True
-    assert manager.get_account(account["id"])["group_id"] == default["id"]
+    mailbox = client.get("/api/mailboxes/work@icloud.com").get_json()["mailbox"]
+    assert mailbox["group_id"] == default["id"]
 
 
-def test_mailbox_service_filters_by_group_and_returns_group_fields(tmp_path):
+def test_mailbox_service_filters_by_mailbox_group_and_returns_group_fields(tmp_path):
     index = tmp_path / "mailbox_index.json"
     index.write_text(
         json.dumps(
@@ -249,7 +283,7 @@ def test_mailbox_service_filters_by_group_and_returns_group_fields(tmp_path):
     )
 
     service = MailboxService(
-        GroupAwareFakeManager(),
+        MailboxGroupFakeManager(),
         latest_emails_path=tmp_path / "latest_emails.txt",
         index_path=index,
     )

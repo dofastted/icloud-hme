@@ -11,7 +11,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
 from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
 from shared_mailboxes import SharedMailboxStore
@@ -77,7 +77,7 @@ def _require_api_key(fn):
     return wrapper
 
 def _safe_account(account):
-    safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password")}
+    safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password","group_id","group_name","group_color")}
     safe["has_mail_config"] = account_has_mail_config(account)
     safe["mail_email"] = account_mail_email(account)
     safe["mail_host"] = account_mail_host(account)
@@ -89,6 +89,24 @@ def _list_groups_safe():
     if not callable(list_groups):
         return []
     return list_groups()
+
+def _groups_with_mailbox_counts():
+    groups = [dict(group) for group in _list_groups_safe()]
+    if not groups:
+        return []
+    default_id = next((group.get("id") for group in groups if group.get("is_default")), DEFAULT_GROUP_ID)
+    counts = {group.get("id"): 0 for group in groups if group.get("id")}
+    try:
+        for mailbox in _mailbox_service.list_mailboxes():
+            gid = mailbox.get("group_id") or default_id
+            if gid not in counts:
+                gid = default_id
+            counts[gid] = counts.get(gid, 0) + 1
+    except Exception:
+        pass
+    for group in groups:
+        group["mailbox_count"] = counts.get(group.get("id"), group.get("mailbox_count", 0))
+    return groups
 
 class _RateLimiter:
     def __init__(self):
@@ -398,7 +416,7 @@ def api_v1_accounts():
         item = _safe_account(account)
         item["has_cookies"] = bool(account.get("cookies"))
         accounts.append(item)
-    groups = _list_groups_safe()
+    groups = _groups_with_mailbox_counts()
     return jsonify({"ok":True,"accounts":accounts,"count":len(accounts),"groups":groups})
 
 @app.route("/api/v1/accounts", methods=["POST"])
@@ -412,7 +430,6 @@ def api_v1_add_account():
         data.get("name", "未命名账号"),
         cookie_input,
         data.get("host", "icloud.com"),
-        data.get("group_id", ""),
     )
     return jsonify({"ok":True,"account":_safe_account(account)})
 
@@ -493,6 +510,9 @@ def _available_hme_item(item: dict, accounts: dict) -> dict:
         "account_id": item.get("account_id", ""),
         "account_name": item.get("account_name", ""),
         "label": item.get("label", ""),
+        "group_id": item.get("group_id", DEFAULT_GROUP_ID),
+        "group_name": item.get("group_name", ""),
+        "group_color": item.get("group_color", ""),
         "created_at": item.get("created_at", ""),
         "is_active": bool(item.get("is_active")),
         "can_read_mail": account.get("status") == "active",
@@ -762,12 +782,12 @@ def api_accounts():
         ac = _safe_account(a)
         ac["has_cookies"] = bool(a.get("cookies"))
         safe.append(ac)
-    groups = _list_groups_safe()
+    groups = _groups_with_mailbox_counts()
     return jsonify({"accounts":safe,"count":len(safe),"groups":groups})
 
 @app.route("/api/groups")
 def api_groups():
-    groups = _account_mgr.list_groups()
+    groups = _groups_with_mailbox_counts()
     return jsonify({"ok":True,"groups":groups,"count":len(groups)})
 
 @app.route("/api/groups", methods=["POST"])
@@ -789,7 +809,7 @@ def api_reorder_groups():
 
 @app.route("/api/groups/<group_id>")
 def api_group_detail(group_id):
-    group = _account_mgr.get_group(group_id)
+    group = next((group for group in _groups_with_mailbox_counts() if group.get("id") == group_id), None)
     if not group:
         return jsonify({"ok":False,"error":"分组不存在"}), 404
     return jsonify({"ok":True,"group":group})
@@ -810,11 +830,14 @@ def api_update_group(group_id):
 def api_delete_group(group_id):
     return jsonify({"ok":_account_mgr.delete_group(group_id)})
 
-@app.route("/api/accounts/batch-group", methods=["POST"])
-@app.route("/api/accounts/batch-update-group", methods=["POST"])
-def api_batch_update_group():
+@app.route("/api/mailboxes/batch-group", methods=["POST"])
+@app.route("/api/mailboxes/batch-update-group", methods=["POST"])
+def api_mailboxes_batch_update_group():
     data = request.get_json() or {}
-    moved = _account_mgr.move_accounts_to_group(data.get("account_ids", []), data.get("group_id", ""))
+    aliases = data.get("alias_emails") or data.get("aliases") or data.get("mailboxes") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    moved = _account_mgr.move_mailboxes_to_group(aliases, data.get("group_id", ""))
     return jsonify({"ok":True,"moved":moved})
 
 @app.route("/api/accounts/add", methods=["POST"])
@@ -828,11 +851,10 @@ def api_add_account():
             name,
             cookie_input,
             data.get("host", "icloud.com"),
-            data.get("group_id", ""),
         )
         _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
         safe = _safe_account(account)
-        return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status",""),"account":safe,"group_id":account.get("group_id","")})
+        return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status",""),"account":safe})
     except ValueError as e: return jsonify({"ok":False,"error":str(e)})
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
@@ -850,15 +872,12 @@ def api_update_account_session(acc_id):
     if not cookie_input:
         return jsonify({"ok":False,"error":"请提供 cookie_input"})
     try:
-        update_args = [
+        account = _account_mgr.update_account_session(
             acc_id,
             data.get("name", "未命名账号"),
             cookie_input,
             data.get("host", "icloud.com"),
-        ]
-        if "group_id" in data:
-            update_args.append(data.get("group_id"))
-        account = _account_mgr.update_account_session(*update_args)
+        )
         _emit_log("info", f"更新账号会话: {account.get('name','')} ({account.get('real_email','?')})")
         return jsonify({"ok":True,"account":_safe_account(account)})
     except KeyError as e:

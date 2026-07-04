@@ -2,11 +2,6 @@
   const S = window.HME;
   let addAccountPending = false;
 
-  function groupOptions(selected){
-    const groups = S.groups && S.groups.length ? S.groups : [{id:'grp_default', name:'默认分组'}];
-    return groups.map(g => '<option value="' + S.esc(g.id) + '"' + (g.id === selected ? ' selected' : '') + '>' + S.esc(g.name || g.id) + '</option>').join('');
-  }
-
   S.renderDashboard = async function(){
     S.setTitle('仪表盘');
     const st = S.state;
@@ -26,7 +21,7 @@
   };
 
   S.showAddAccountModal = function(){
-    S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 导入 iCloud Cookie</h3><p class="muted">支持 Cookie Editor 的 Header String 或 JSON。</p><label class="label">账号名称</label><input id="accNameInput" placeholder="账号名称"><label class="label">所属分组</label><select id="accGroupInput">' + groupOptions('grp_default') + '</select><label class="label">Cookie / session 数据</label><textarea id="cookieInput" placeholder="name=value; name2=value2"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button id="addAccountSubmit" class="btn" onclick="HME.addAccount()">添加并校验</button></div><div id="modalMsg" class="warning"></div></div></div>';
+    S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 导入 iCloud Cookie</h3><p class="muted">支持 Cookie Editor 的 Header String 或 JSON。</p><label class="label">账号名称</label><input id="accNameInput" placeholder="账号名称"><label class="label">Cookie / session 数据</label><textarea id="cookieInput" placeholder="name=value; name2=value2"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button id="addAccountSubmit" class="btn" onclick="HME.addAccount()">添加并校验</button></div><div id="modalMsg" class="warning"></div></div></div>';
   };
   S.closeModal = function(){ S.E('modalRoot').innerHTML = ''; };
   S.addAccount = async function(){
@@ -42,9 +37,8 @@
     try {
       const name = S.E('accNameInput').value.trim() || '未命名账号';
       const cookie_input = S.E('cookieInput').value.trim();
-      const group_id = S.E('accGroupInput') ? S.E('accGroupInput').value : '';
       if (!cookie_input) throw new Error('请粘贴 Cookie');
-      await S.api('/api/accounts/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, cookie_input, group_id})});
+      await S.api('/api/accounts/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, cookie_input})});
       S.closeModal();
       S.toast('账号已添加');
       S.refreshAll();
@@ -77,7 +71,7 @@
     try {
       const data = await S.api('/api/accounts/' + encodeURIComponent(id) + '/session');
       const account = data.account || {};
-      S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 编辑账号 Session</h3><p class="muted">这里会显示并更新本机保存的 Cookie / session 数据。内容敏感，不要分享。</p><label class="label">账号名称</label><input id="editAccountNameInput" placeholder="账号名称" value="' + S.esc(account.name || '') + '"><label class="label">所属分组</label><select id="editAccountGroupInput">' + groupOptions(account.group_id || 'grp_default') + '</select><label class="label">iCloud Host</label><input id="editAccountHostInput" placeholder="icloud.com" value="' + S.esc(account.host || 'icloud.com') + '"><label class="label">Cookie / session 数据</label><textarea id="editAccountSessionInput" placeholder="name=value; name2=value2">' + S.esc(account.cookie_input || '') + '</textarea><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button id="editAccountSubmit" class="btn" onclick="HME.saveAccountSession(' + S.inlineArg(id) + ')">保存并校验</button></div><div id="modalMsg" class="warning"></div></div></div>';
+      S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 编辑账号 Session</h3><p class="muted">这里会显示并更新本机保存的 Cookie / session 数据。内容敏感，不要分享。</p><label class="label">账号名称</label><input id="editAccountNameInput" placeholder="账号名称" value="' + S.esc(account.name || '') + '"><label class="label">iCloud Host</label><input id="editAccountHostInput" placeholder="icloud.com" value="' + S.esc(account.host || 'icloud.com') + '"><label class="label">Cookie / session 数据</label><textarea id="editAccountSessionInput" placeholder="name=value; name2=value2">' + S.esc(account.cookie_input || '') + '</textarea><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button id="editAccountSubmit" class="btn" onclick="HME.saveAccountSession(' + S.inlineArg(id) + ')">保存并校验</button></div><div id="modalMsg" class="warning"></div></div></div>';
     } catch (err) { S.toast(err.message, true); }
   };
   S.saveAccountSession = async function(id){
@@ -92,9 +86,8 @@
       const name = S.E('editAccountNameInput').value.trim() || '未命名账号';
       const host = S.E('editAccountHostInput').value.trim() || 'icloud.com';
       const cookie_input = S.E('editAccountSessionInput').value.trim();
-      const group_id = S.E('editAccountGroupInput') ? S.E('editAccountGroupInput').value : '';
       if (!cookie_input) throw new Error('请填写 Cookie / session 数据');
-      const res = await S.api('/api/accounts/' + encodeURIComponent(id) + '/session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, host, cookie_input, group_id})});
+      const res = await S.api('/api/accounts/' + encodeURIComponent(id) + '/session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, host, cookie_input})});
       S.closeModal();
       S.toast(res.account && res.account.status === 'error' ? '账号已更新，校验失败' : '账号已更新');
       S.refreshAll();

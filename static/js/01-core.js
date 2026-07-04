@@ -57,7 +57,7 @@
     S.E('schedDot').className = 'status-dot ' + (S.state.running ? 'online' : '');
     S.E('schedLabel').textContent = '调度器: ' + (S.state.running ? '运行中' : '就绪');
     S.E('btnSched').textContent = S.state.running ? '停止调度器' : '启动调度器';
-    S.E('sidebarAccounts').innerHTML = S.accounts.map(a => '<div class="account-row ' + (a.status === 'active' ? 'active' : '') + '"><span class="status-dot ' + (a.status === 'active' ? 'online' : '') + '"></span><span title="' + S.esc(a.real_email || '') + '">' + S.esc(a.name || a.id) + '</span><span class="muted mono">' + S.esc(a.group_name || '') + '</span></div>').join('') || '<div class="muted mono" style="font-size:12px;padding:8px 0">暂无账号</div>';
+    S.E('sidebarAccounts').innerHTML = S.accounts.map(a => '<div class="account-row ' + (a.status === 'active' ? 'active' : '') + '"><span class="status-dot ' + (a.status === 'active' ? 'online' : '') + '"></span><span title="' + S.esc(a.real_email || '') + '">' + S.esc(a.name || a.id) + '</span></div>').join('') || '<div class="muted mono" style="font-size:12px;padding:8px 0">暂无账号</div>';
   }
 
   async function refreshAll(){
