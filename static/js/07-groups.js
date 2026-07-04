@@ -14,7 +14,7 @@
         const name = S.esc(g.name || g.id);
         const color = S.esc(g.color || '#1f8b4c');
         const badge = '<span class="badge" style="border-color:' + color + '">' + name + '</span>';
-        const actions = g.is_default ? '<span class="muted">默认分组</span>' : '<button class="btn btn-outline btn-sm" onclick="HME.showGroupModal(' + idArg + ')">编辑</button> <button class="btn btn-danger btn-sm" onclick="HME.deleteGroup(' + idArg + ')">删除</button>';
+        const actions = (g.is_system || g.is_default) ? '<span class="muted">内置状态分组</span>' : '<button class="btn btn-outline btn-sm" onclick="HME.showGroupModal(' + idArg + ')">编辑</button> <button class="btn btn-danger btn-sm" onclick="HME.deleteGroup(' + idArg + ')">删除</button>';
         return '<tr><td>' + (i + 1) + '</td><td>' + badge + '</td><td>' + S.esc(g.description || '') + '</td><td>' + (g.mailbox_count || 0) + '</td><td>' + (g.sort_order || 0) + '</td><td>' + actions + '</td></tr>';
       }).join('');
       const body = rows || '<tr><td colspan="6" class="muted">暂无分组</td></tr>';

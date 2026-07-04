@@ -525,10 +525,10 @@ GET /api/shared/<redemption_code>/latest?force=0
 | `GET` | `/api/state` | 当前运行状态、账号和别名统计 |
 | `GET` | `/api/accounts` | 本地账号列表和邮箱分组摘要，敏感字段已过滤 |
 | `POST` | `/api/accounts/add` | 导入账号 Cookie |
-| `GET` | `/api/groups` | 获取本地邮箱分组列表 |
-| `POST` | `/api/groups` | 创建邮箱分组 |
-| `PUT` | `/api/groups/{id}` | 更新邮箱分组 |
-| `DELETE` | `/api/groups/{id}` | 删除邮箱分组，邮箱回到默认分组 |
+| `GET` | `/api/groups` | 获取本地邮箱分组列表，默认内置 `可用`、`不可用`、`废弃` |
+| `POST` | `/api/groups` | 创建自定义邮箱分组 |
+| `PUT` | `/api/groups/{id}` | 更新自定义邮箱分组 |
+| `DELETE` | `/api/groups/{id}` | 删除自定义邮箱分组，邮箱回到“可用”分组 |
 | `PUT` | `/api/groups/reorder` | 调整自定义分组顺序 |
 | `POST` | `/api/mailboxes/batch-update-group` | 批量移动 HME 邮箱到指定分组 |
 | `POST` | `/api/accounts/{id}/remove` | 删除账号 |

@@ -22,37 +22,55 @@
     return '<span class="badge" style="border-color:' + S.esc(mailbox.group_color || '#ddd') + '">' + S.esc(mailbox.group_name) + '</span>';
   }
 
+  function mailboxRows(items){
+    return (items || []).map((m, i) => {
+      const aliasArg = S.inlineArg(m.alias_email);
+      const routeArg = S.inlineArg('#/mailbox/' + encodeURIComponent(m.alias_email));
+      const groupArg = S.inlineArg(m.group_id || 'grp_default');
+      return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + S.esc(m.label || '') + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(' + aliasArg + ');HME.toast(\'已复制\')">复制</button> <button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">兑换码</button></td></tr>';
+    }).join('');
+  }
+
+  function mailboxTable(items){
+    if (!items || !items.length) return S.empty('暂无邮箱 - 去仪表盘或批量创建生成', '<button class="btn btn-sm" onclick="HME.navigate(\'#/batch\')">去批量创建</button>');
+    return '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>标签</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + mailboxRows(items) + '</tbody></table></div>';
+  }
+
+  function mailboxSource(data){
+    if (!data) return '<span class="muted mono">读取本地列表...</span>';
+    const source = data.source === 'local' ? '本地列表' : (data.source || '列表');
+    const synced = data.index_updated_at ? ' · synced ' + data.index_updated_at : '';
+    return '<span class="muted mono">' + S.esc(source + synced) + '</span>';
+  }
+
+  function filterHtml(q, account, group, status, refresh){
+    const accountOptions = ['<option value="">全部账号</option>'].concat(S.accounts.map(a => '<option value="' + S.esc(a.id) + '"' + (a.id === account ? ' selected' : '') + '>' + S.esc(a.name || a.id) + '</option>')).join('');
+    const groupOptionsHtml = groupOptions(group, '全部分组');
+    const syncLabel = refresh ? '同步中...' : '云端同步';
+    return '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxGroup">' + groupOptionsHtml + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select><button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
+  }
+
   S.renderMailboxes = async function(refresh){
     S.setTitle('邮箱列表');
-    S.view(S.loading(6));
     const p = params();
     const q = p.get('q') || '';
     const account = p.get('account') || '';
     const group = p.get('group_id') || p.get('group') || '';
     const status = p.get('status') || '';
+    const current = S.mailboxes && S.mailboxes.length ? mailboxTable(S.mailboxes) : S.empty('读取本地邮箱列表...');
+    S.view('<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(null) + '</span></div>' + filterHtml(q, account, group, status, refresh) + '<div id="mailboxListBody">' + current + '</div></div>');
+    bindFilters();
     try {
       const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&group_id=' + encodeURIComponent(group) + '&status=' + encodeURIComponent(status) + '&limit=200' + (refresh ? '&refresh=1' : '');
       const data = await S.api('/api/mailboxes?' + query);
       S.mailboxes = data.mailboxes || [];
-      const accountOptions = ['<option value="">全部账号</option>'].concat(S.accounts.map(a => '<option value="' + S.esc(a.id) + '"' + (a.id === account ? ' selected' : '') + '>' + S.esc(a.name || a.id) + '</option>')).join('');
-      const groupOptionsHtml = groupOptions(group, '全部分组');
-      const syncLabel = refresh ? '同步完成' : '云端同步';
-      const filter = '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxGroup">' + groupOptionsHtml + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select><button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
-      if (!S.mailboxes.length) {
-        S.view('<div class="panel"><div class="panel-head">隐私邮箱</div>' + filter + S.empty('暂无邮箱 - 去仪表盘或批量创建生成', '<button class="btn btn-sm" onclick="HME.navigate(\'#/batch\')">去批量创建</button>') + '</div>');
-        bindFilters();
-        return;
-      }
-      const rows = S.mailboxes.map((m, i) => {
-        const aliasArg = S.inlineArg(m.alias_email);
-        const routeArg = S.inlineArg('#/mailbox/' + encodeURIComponent(m.alias_email));
-        const groupArg = S.inlineArg(m.group_id || 'grp_default');
-        return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + S.esc(m.label || '') + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(' + aliasArg + ')">复制</button> <button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">兑换码</button></td></tr>';
-      }).join('');
-      S.view('<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span>' + data.total + ' total</span></div>' + filter + '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>标签</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>');
+      const finalHtml = '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(data) + ' · ' + (data.total || 0) + ' total</span></div>' + filterHtml(q, account, group, status, false) + '<div id="mailboxListBody">' + mailboxTable(S.mailboxes) + '</div></div>';
+      S.view(finalHtml);
       bindFilters();
     } catch (err) {
-      S.view(S.error(err, 'HME.renderMailboxes()'));
+      const body = S.E('mailboxListBody');
+      if (body) body.innerHTML = S.error(err, 'HME.renderMailboxes()');
+      else S.view(S.error(err, 'HME.renderMailboxes()'));
     }
   };
 
@@ -66,6 +84,7 @@
     if (group) group.addEventListener('change', applyFilters);
     if (status) status.addEventListener('change', applyFilters);
   }
+
   function applyFilters(){
     const qp = new URLSearchParams();
     const q = S.E('mailboxQ')?.value.trim();
@@ -79,29 +98,49 @@
     S.navigate('#/mailboxes' + (qp.toString() ? '?' + qp.toString() : ''));
   }
 
+  function latestMailHtml(alias, msg, mailError){
+    if (mailError) return S.empty(mailError);
+    if (!msg) return S.empty('暂无邮件');
+    return '<div class="message-body"><div class="label">主题</div><h3>' + S.esc(msg.subject || '(无主题)') + '</h3><p class="muted mono">From: ' + S.esc(msg.from) + '<br>To: ' + S.esc(msg.to) + '<br>Date: ' + S.esc(msg.date) + '</p><pre id="detailBody">' + S.esc(msg.body_preview || '') + '</pre><button class="btn btn-outline btn-sm" onclick="HME.loadMessageBody(' + S.inlineArg(alias) + ',' + S.inlineArg(msg.message_id) + ')">展开正文</button></div>';
+  }
+
+  function mailboxDetailHtml(alias, m, latest){
+    const shared = m.shared;
+    const sharePanel = shared ? '<p class="mono">兑换码前缀 ' + S.esc(shared.prefix) + '</p><p class="muted mono">created ' + S.esc(shared.created_at || '') + '<br>last ' + S.esc(shared.last_accessed_at || '') + '<br>access ' + (shared.access_count || 0) + '</p><button class="btn btn-danger btn-sm" onclick="HME.revokeShare(' + S.inlineArg(shared.id) + ',' + S.inlineArg(alias) + ')">吊销</button>' : '<p class="muted">用户通过共享主入口输入兑换码，可查看该邮箱最新一封邮件。</p><button class="btn btn-sm" onclick="HME.createShare(' + S.inlineArg(alias) + ')">生成兑换码</button>';
+    return '<div class="panel"><div class="panel-body"><button class="btn btn-outline btn-sm" onclick="HME.navigate(\'#/mailboxes\')">返回列表</button><div class="detail-title">' + S.esc(m.alias_email) + '</div><p class="muted mono">' + S.esc(m.account_name || m.account_id) + ' · ' + S.esc(m.label || '') + ' · ' + (m.is_active ? 'ACTIVE' : 'OFF') + ' · ' + groupBadge(m) + '</p><button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + S.inlineArg(alias) + ',' + S.inlineArg(m.group_id || 'grp_default') + ')">移动分组</button></div></div><div class="panel"><div class="panel-head"><span>最新邮件</span><span><button class="btn btn-outline btn-sm" onclick="HME.loadMailboxLatest(' + S.inlineArg(alias) + ',true)">刷新此邮箱邮件</button></span></div><div class="panel-body" id="mailboxLatest">' + latest + '</div></div><div class="panel"><div class="panel-head">共享访问</div><div class="panel-body">' + sharePanel + '</div></div>';
+  }
+
   S.renderMailboxDetail = async function(alias){
     S.setTitle('单邮箱详情', '邮箱列表 / ' + alias);
-    S.view(S.loading(4));
+    S.view(mailboxDetailHtml(alias, {alias_email: alias, account_id: '', account_name: '', label: '', is_active: true, shared: null}, S.empty('正在读取本地邮箱详情...')));
+    const latestPromise = S.loadMailboxLatest(alias, false);
     try {
       const box = await S.api('/api/mailboxes/' + encodeURIComponent(alias));
-      let msgs = {messages: []};
-      let mailError = '';
-      try {
-        msgs = await S.api('/api/mailboxes/' + encodeURIComponent(alias) + '/messages?limit=1');
-      } catch (err) {
-        mailError = mailReadError(err);
-      }
-      const m = box.mailbox;
-      const msg = (msgs.messages || [])[0];
-      const shared = m.shared;
-      let latest = '';
-      if (mailError) latest = S.empty(mailError);
-      else if (!msg) latest = S.empty('暂无邮件');
-      else latest = '<div class="message-body"><div class="label">主题</div><h3>' + S.esc(msg.subject || '(无主题)') + '</h3><p class="muted mono">From: ' + S.esc(msg.from) + '<br>To: ' + S.esc(msg.to) + '<br>Date: ' + S.esc(msg.date) + '</p><pre id="detailBody">' + S.esc(msg.body_preview || '') + '</pre><button class="btn btn-outline btn-sm" onclick="HME.loadMessageBody(' + S.inlineArg(alias) + ',' + S.inlineArg(msg.message_id) + ')">展开正文</button></div>';
-      const sharePanel = shared ? '<p class="mono">兑换码前缀 ' + S.esc(shared.prefix) + '</p><p class="muted mono">created ' + S.esc(shared.created_at || '') + '<br>last ' + S.esc(shared.last_accessed_at || '') + '<br>access ' + (shared.access_count || 0) + '</p><button class="btn btn-danger btn-sm" onclick="HME.revokeShare(' + S.inlineArg(shared.id) + ',' + S.inlineArg(alias) + ')">吊销</button>' : '<p class="muted">用户通过共享主入口输入兑换码，可查看该邮箱最新一封邮件。</p><button class="btn btn-sm" onclick="HME.createShare(' + S.inlineArg(alias) + ')">生成兑换码</button>';
-      S.view('<div class="panel"><div class="panel-body"><button class="btn btn-outline btn-sm" onclick="HME.navigate(\'#/mailboxes\')">返回列表</button><div class="detail-title">' + S.esc(m.alias_email) + '</div><p class="muted mono">' + S.esc(m.account_name || m.account_id) + ' · ' + S.esc(m.label || '') + ' · ' + (m.is_active ? 'ACTIVE' : 'OFF') + ' · ' + groupBadge(m) + '</p><button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + S.inlineArg(alias) + ',' + S.inlineArg(m.group_id || 'grp_default') + ')">移动分组</button></div></div><div class="panel"><div class="panel-head"><span>最新邮件</span><span><button class="btn btn-outline btn-sm" onclick="HME.renderMailboxDetail(' + S.inlineArg(alias) + ')">刷新</button> <button class="btn btn-outline btn-sm" onclick="HME.forceMailbox(' + S.inlineArg(alias) + ')">强制刷新</button></span></div><div class="panel-body">' + latest + '</div></div><div class="panel"><div class="panel-head">共享访问</div><div class="panel-body">' + sharePanel + '</div></div>');
+      const loading = S.empty('正在读取该 HME 最新邮件...');
+      S.view(mailboxDetailHtml(alias, box.mailbox, loading));
+      const latest = await latestPromise;
+      if (latest) S.view(mailboxDetailHtml(alias, box.mailbox, latest));
     } catch (err) {
       S.view(S.error(err, 'HME.renderMailboxDetail(\'' + S.esc(alias) + '\')'));
+    }
+  };
+
+  S.loadMailboxLatest = async function(alias, force){
+    const target = S.E('mailboxLatest');
+    const loading = S.empty(force ? '正在刷新该 HME 邮件...' : '正在读取该 HME 最新邮件...');
+    if (target) target.innerHTML = loading;
+    try {
+      const data = await S.api('/api/mailboxes/' + encodeURIComponent(alias) + '/messages?limit=1' + (force ? '&force=1' : ''));
+      const msg = (data.messages || [])[0];
+      const html = latestMailHtml(alias, msg, '');
+      if (target) target.innerHTML = html;
+      return html;
+    } catch (err) {
+      const text = mailReadError(err);
+      const html = latestMailHtml(alias, null, text);
+      if (target) target.innerHTML = html;
+      if (force) S.toast(text, true);
+      return html;
     }
   };
 
@@ -122,21 +161,21 @@
   };
 
   S.forceMailbox = async function(alias){
-    try {
-      await S.api('/api/mailboxes/' + encodeURIComponent(alias) + '/messages?limit=1&force=1');
-      S.renderMailboxDetail(alias);
-    } catch (err) { S.toast(mailReadError(err), true); S.renderMailboxDetail(alias); }
+    return S.loadMailboxLatest(alias, true);
   };
+
   S.loadMessageBody = async function(alias, id){
     try {
       const data = await S.api('/api/mailboxes/' + encodeURIComponent(alias) + '/messages/' + encodeURIComponent(id));
       S.E('detailBody').textContent = data.message.body || '(无正文)';
     } catch (err) { S.toast(mailReadError(err), true); }
   };
+
   S.copyMailboxes = function(){
     navigator.clipboard.writeText(S.mailboxes.map(m => m.alias_email).join('\n'));
     S.toast('已复制 ' + S.mailboxes.length + ' 个邮箱');
   };
+
   S.exportMailboxes = function(){
     const csv = 'alias_email,account,group,label,active,shared\n' + S.mailboxes.map(m => [m.alias_email, m.account_name || m.account_id, m.group_name || '', m.label || '', m.is_active ? 'yes' : 'no', m.shared ? m.shared.prefix : ''].map(v => '"' + String(v).replace(/"/g,'""') + '"').join(',')).join('\n');
     const a = document.createElement('a');

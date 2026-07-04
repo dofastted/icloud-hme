@@ -23,6 +23,7 @@ import os
 import json
 import time
 import uuid
+import hashlib
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -34,9 +35,39 @@ OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
 SCHEDULER_ALIAS_LIMIT = int(os.environ.get("HME_SCHEDULER_ALIAS_LIMIT", "750"))
+SCHEDULER_REFRESH_MARGIN = int(os.environ.get("HME_SCHEDULER_REFRESH_MARGIN", "5"))
 DEFAULT_GROUP_ID = "grp_default"
-DEFAULT_GROUP_NAME = "默认分组"
+DEFAULT_GROUP_NAME = "可用"
 DEFAULT_GROUP_COLOR = "#1f8b4c"
+UNAVAILABLE_GROUP_ID = "grp_unavailable"
+DEPRECATED_GROUP_ID = "grp_deprecated"
+BUILTIN_GROUP_DEFINITIONS = (
+    {
+        "id": DEFAULT_GROUP_ID,
+        "name": DEFAULT_GROUP_NAME,
+        "description": "可继续使用的 HME 邮箱",
+        "color": DEFAULT_GROUP_COLOR,
+        "sort_order": 0,
+        "is_default": True,
+    },
+    {
+        "id": UNAVAILABLE_GROUP_ID,
+        "name": "不可用",
+        "description": "暂时无法使用或需要检查的 HME 邮箱",
+        "color": "#d97706",
+        "sort_order": 1,
+        "is_default": False,
+    },
+    {
+        "id": DEPRECATED_GROUP_ID,
+        "name": "废弃",
+        "description": "不再使用的 HME 邮箱",
+        "color": "#6b7280",
+        "sort_order": 2,
+        "is_default": False,
+    },
+)
+BUILTIN_GROUP_IDS = {group["id"] for group in BUILTIN_GROUP_DEFINITIONS}
 MAIL_PROVIDER_HOSTS = {
     "icloud.com": "imap.mail.me.com",
     "me.com": "imap.mail.me.com",
@@ -82,6 +113,16 @@ def account_has_mail_config(account: Dict) -> bool:
     return bool(account_mail_email(account) and account_mail_host(account) and (account.get("mail_password") or account.get("app_password")))
 
 
+def coerce_mail_port(port: Any) -> int:
+    try:
+        value = int(port or 993)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("端口必须是数字") from exc
+    if value < 1 or value > 65535:
+        raise ValueError("端口必须在 1-65535 之间")
+    return value
+
+
 def account_alias_total(account: Dict) -> int:
     try:
         return int(account.get("alias_total") or 0)
@@ -91,6 +132,17 @@ def account_alias_total(account: Dict) -> int:
 
 def account_reached_scheduler_limit(account: Dict, limit: int = SCHEDULER_ALIAS_LIMIT) -> bool:
     return account_alias_total(account) >= limit
+
+
+def scheduler_count_needs_refresh(
+    account: Dict,
+    limit: int = SCHEDULER_ALIAS_LIMIT,
+    margin: int = SCHEDULER_REFRESH_MARGIN,
+) -> bool:
+    total = account_alias_total(account)
+    if total < 0:
+        return True
+    return 0 < limit - total <= margin
 
 
 def scheduler_eligible_accounts(accounts: List[Dict], limit: int = SCHEDULER_ALIAS_LIMIT) -> List[Dict]:
@@ -109,6 +161,7 @@ class AccountManager:
         self.accounts: Dict[str, Dict] = {}
         self.groups: Dict[str, Dict] = {}
         self.mailbox_groups: Dict[str, str] = {}
+        self.imap_configs: Dict[str, Dict] = {}
         self._lock = threading.RLock()
         self._cache = get_cache()
         self._load()
@@ -135,10 +188,13 @@ class AccountManager:
                     self.groups = groups
                 mailbox_groups = data.get("mailbox_groups", {})
                 self.mailbox_groups = mailbox_groups if isinstance(mailbox_groups, dict) else {}
+                imap_configs = data.get("imap_configs", {})
+                self.imap_configs = imap_configs if isinstance(imap_configs, dict) else {}
             except (json.JSONDecodeError, OSError):
                 self.accounts = {}
                 self.groups = {}
                 self.mailbox_groups = {}
+                self.imap_configs = {}
         changed = self._normalize_loaded_state()
         if changed:
             self._save()
@@ -151,6 +207,7 @@ class AccountManager:
                     "accounts": self.accounts,
                     "groups": self.groups,
                     "mailbox_groups": self.mailbox_groups,
+                    "imap_configs": self.imap_configs,
                     "updated_at": datetime.now().isoformat(),
                 }, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -190,17 +247,22 @@ class AccountManager:
     def _generate_group_id(self) -> str:
         return "grp_" + uuid.uuid4().hex[:8]
 
+    def _generate_imap_config_id(self) -> str:
+        return "imap_" + uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _builtin_group(group_id: str) -> Dict[str, Any]:
+        for group in BUILTIN_GROUP_DEFINITIONS:
+            if group["id"] == group_id:
+                item = dict(group)
+                item["is_system"] = True
+                item["created_at"] = datetime.now().isoformat()
+                return item
+        raise KeyError(group_id)
+
     @staticmethod
     def _default_group() -> Dict[str, Any]:
-        return {
-            "id": DEFAULT_GROUP_ID,
-            "name": DEFAULT_GROUP_NAME,
-            "description": "",
-            "color": DEFAULT_GROUP_COLOR,
-            "sort_order": 0,
-            "is_default": True,
-            "created_at": datetime.now().isoformat(),
-        }
+        return AccountManager._builtin_group(DEFAULT_GROUP_ID)
 
     def _normalize_loaded_state(self) -> bool:
         changed = False
@@ -208,9 +270,11 @@ class AccountManager:
             self.groups = {}
             changed = True
 
-        if DEFAULT_GROUP_ID not in self.groups:
-            self.groups[DEFAULT_GROUP_ID] = self._default_group()
-            changed = True
+        for definition in BUILTIN_GROUP_DEFINITIONS:
+            gid = definition["id"]
+            if gid not in self.groups or not isinstance(self.groups.get(gid), dict):
+                self.groups[gid] = self._builtin_group(gid)
+                changed = True
 
         for gid, group in list(self.groups.items()):
             if not isinstance(group, dict):
@@ -226,37 +290,48 @@ class AccountManager:
             if group.get("id") != gid:
                 group["id"] = gid
                 changed = True
-            if not str(group.get("name") or "").strip():
-                group["name"] = DEFAULT_GROUP_NAME if gid == DEFAULT_GROUP_ID else gid
-                changed = True
-            normalized_color = normalize_group_color(group.get("color"))
-            if group.get("color") != normalized_color:
-                group["color"] = normalized_color
-                changed = True
+
+            definition = next((item for item in BUILTIN_GROUP_DEFINITIONS if item["id"] == gid), None)
+            if definition:
+                for key in ("name", "description", "color", "sort_order", "is_default"):
+                    if group.get(key) != definition[key]:
+                        group[key] = definition[key]
+                        changed = True
+                if group.get("is_system") is not True:
+                    group["is_system"] = True
+                    changed = True
+            else:
+                if not str(group.get("name") or "").strip():
+                    group["name"] = gid
+                    changed = True
+                normalized_color = normalize_group_color(group.get("color"))
+                if group.get("color") != normalized_color:
+                    group["color"] = normalized_color
+                    changed = True
+                if group.get("is_default") is not False:
+                    group["is_default"] = False
+                    changed = True
+                if group.get("is_system") is not False:
+                    group["is_system"] = False
+                    changed = True
+                try:
+                    group["sort_order"] = int(group.get("sort_order") or 0)
+                except (TypeError, ValueError):
+                    group["sort_order"] = 0
+                    changed = True
+
             if "description" not in group:
                 group["description"] = ""
                 changed = True
             if "created_at" not in group:
                 group["created_at"] = datetime.now().isoformat()
                 changed = True
-            try:
-                group["sort_order"] = int(group.get("sort_order") or 0)
-            except (TypeError, ValueError):
-                group["sort_order"] = 0
-                changed = True
-            is_default = gid == DEFAULT_GROUP_ID
-            if group.get("is_default") is not is_default:
-                group["is_default"] = is_default
-                changed = True
 
-        if DEFAULT_GROUP_ID not in self.groups:
-            self.groups[DEFAULT_GROUP_ID] = self._default_group()
-            changed = True
-
-        default = self.groups[DEFAULT_GROUP_ID]
-        if default.get("sort_order") != 0:
-            default["sort_order"] = 0
-            changed = True
+        for definition in BUILTIN_GROUP_DEFINITIONS:
+            gid = definition["id"]
+            if gid not in self.groups:
+                self.groups[gid] = self._builtin_group(gid)
+                changed = True
 
         if not isinstance(self.mailbox_groups, dict):
             self.mailbox_groups = {}
@@ -277,11 +352,57 @@ class AccountManager:
                 self.mailbox_groups[raw_alias] = gid
                 changed = True
 
+        if not isinstance(self.imap_configs, dict):
+            self.imap_configs = {}
+            changed = True
+
+        for raw_id, config in list(self.imap_configs.items()):
+            if not isinstance(config, dict):
+                del self.imap_configs[raw_id]
+                changed = True
+                continue
+            config_id = str(config.get("id") or raw_id).strip() or self._generate_imap_config_id()
+            if config_id != raw_id:
+                del self.imap_configs[raw_id]
+                self.imap_configs[config_id] = config
+                changed = True
+            if config.get("id") != config_id:
+                config["id"] = config_id
+                changed = True
+            for key in ("name", "email", "password", "host"):
+                value = str(config.get(key) or "").strip()
+                if config.get(key) != value:
+                    config[key] = value
+                    changed = True
+            inferred_host = config.get("host") or infer_mail_host(config.get("email", ""))
+            if config.get("host") != inferred_host:
+                config["host"] = inferred_host
+                changed = True
+            try:
+                normalized_port = coerce_mail_port(config.get("port"))
+            except ValueError:
+                normalized_port = 993
+            if config.get("port") != normalized_port:
+                config["port"] = normalized_port
+                changed = True
+            if not config.get("name"):
+                config["name"] = config.get("email") or config_id
+                changed = True
+            if "created_at" not in config:
+                config["created_at"] = datetime.now().isoformat()
+                changed = True
+            if "updated_at" not in config:
+                config["updated_at"] = config.get("created_at") or datetime.now().isoformat()
+                changed = True
+
         for account in self.accounts.values():
             if "group_id" in account:
                 del account["group_id"]
                 changed = True
-
+            config_id = str(account.get("imap_config_id") or "").strip()
+            if config_id and config_id not in self.imap_configs:
+                del account["imap_config_id"]
+                changed = True
         return changed
 
     def _group_id_from_input(self, group_id: Any, default: str = DEFAULT_GROUP_ID) -> str:
@@ -332,16 +453,17 @@ class AccountManager:
                 self.groups.values(),
                 key=lambda g: (int(g.get("sort_order") or 0), g.get("created_at", ""), g.get("id", "")),
             )
-            if group.get("id") != DEFAULT_GROUP_ID and group.get("id") != exclude_group_id
+            if group.get("id") not in BUILTIN_GROUP_IDS and group.get("id") != exclude_group_id
         ]
 
     def _apply_group_order(self, group_ids: List[str]):
-        self.groups[DEFAULT_GROUP_ID]["sort_order"] = 0
-        for index, group_id in enumerate(group_ids, start=1):
+        for definition in BUILTIN_GROUP_DEFINITIONS:
+            self.groups[definition["id"]]["sort_order"] = definition["sort_order"]
+        for index, group_id in enumerate(group_ids, start=len(BUILTIN_GROUP_IDS)):
             self.groups[group_id]["sort_order"] = index
 
     def _set_group_position(self, group_id: str, sort_position: Optional[int]):
-        if group_id == DEFAULT_GROUP_ID:
+        if group_id in BUILTIN_GROUP_IDS:
             return
         group_ids = self._movable_group_ids(exclude_group_id=group_id)
         max_position = len(group_ids) + 1
@@ -359,7 +481,7 @@ class AccountManager:
             counts[gid] = counts.get(gid, 0) + 1
         groups = sorted(
             self.groups.values(),
-            key=lambda g: (g.get("id") != DEFAULT_GROUP_ID, int(g.get("sort_order") or 0), g.get("name", "")),
+            key=lambda g: (0 if g.get("id") in BUILTIN_GROUP_IDS else 1, int(g.get("sort_order") or 0), g.get("name", "")),
         )
         result = []
         for group in groups:
@@ -400,6 +522,8 @@ class AccountManager:
 
     def update_group(self, group_id: str, name: str, description: str = "", color: str = "", sort_position: Optional[int] = None) -> Dict:
         gid = str(group_id or "").strip()
+        if gid in BUILTIN_GROUP_IDS:
+            raise ValueError("内置状态分组不能编辑")
         if gid not in self.groups:
             raise KeyError("分组不存在")
         clean_name = str(name or "").strip()
@@ -421,8 +545,8 @@ class AccountManager:
 
     def delete_group(self, group_id: str) -> bool:
         gid = str(group_id or "").strip()
-        if gid == DEFAULT_GROUP_ID:
-            raise ValueError("默认分组不能删除")
+        if gid in BUILTIN_GROUP_IDS:
+            raise ValueError("内置状态分组不能删除")
         if gid not in self.groups:
             raise KeyError("分组不存在")
         with self._lock:
@@ -450,7 +574,7 @@ class AccountManager:
     @staticmethod
     def _account_identity_values(account: Dict) -> set[str]:
         values = set()
-        for key in ("real_email", "icloud_email"):
+        for key in ("real_email", "icloud_email", "session_fingerprint"):
             value = str(account.get(key) or "").strip().lower()
             if value:
                 values.add(value)
@@ -460,7 +584,10 @@ class AccountManager:
         identities = self._account_identity_values(account)
         if not identities:
             return None
+        current_id = str(account.get("id") or "")
         for existing in self.accounts.values():
+            if current_id and existing.get("id") == current_id:
+                continue
             if identities & self._account_identity_values(existing):
                 return existing
         return None
@@ -501,6 +628,32 @@ class AccountManager:
     def cookies_to_header(cookies: Dict) -> str:
         return "; ".join(f"{name}={value}" for name, value in cookies.items())
 
+    @staticmethod
+    def _session_fingerprint(cookies: Dict, host: str) -> str:
+        payload = json.dumps(
+            {"host": str(host or "icloud.com"), "cookies": cookies or {}},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _mark_session_pending(account: Dict):
+        account["status"] = "pending"
+        account["validation_status"] = "queued"
+        account["validation_started_at"] = None
+        account["last_error"] = None
+
+    @staticmethod
+    def _next_session_version(account: Optional[Dict] = None) -> int:
+        if not account:
+            return 1
+        try:
+            return int(account.get("session_version") or 0) + 1
+        except (TypeError, ValueError):
+            return 1
+
     def _refresh_session_state(self, account: Dict) -> Dict:
         from icloud_hme import ICloudHME
 
@@ -529,44 +682,55 @@ class AccountManager:
                 pass
 
             account["status"] = "active"
+            account["validation_status"] = "ok"
             account["last_validated"] = datetime.now().isoformat()
             account["last_error"] = None
         except Exception as e:
             account["status"] = "error"
+            account["validation_status"] = "error"
             account["last_error"] = str(e)[:300]
 
         return account
 
     def add_account(
         self, name: str, cookie_input: str, host: str = "icloud.com",
-        group_id: str = "",
+        group_id: str = "", validate: bool = True,
     ) -> Dict:
         cookies = self.parse_cookie_input(cookie_input)
         acc_id = self._generate_id()
+        clean_host = str(host or "icloud.com").strip() or "icloud.com"
 
         account: Dict[str, Any] = {
             "id": acc_id,
-            "name": name,
+            "name": str(name or "未命名账号").strip() or "未命名账号",
             "real_email": "",
             "icloud_email": "",
             "cookies": cookies,
-            "host": host,
+            "host": clean_host,
             "status": "active",
+            "validation_status": "ok" if validate else "queued",
+            "validation_started_at": None,
             "alias_total": 0,
             "alias_active": 0,
             "last_validated": None,
             "last_error": None,
+            "session_version": 1,
+            "session_fingerprint": self._session_fingerprint(cookies, clean_host),
             "created_at": datetime.now().isoformat(),
         }
 
-        self._refresh_session_state(account)
+        if validate:
+            self._refresh_session_state(account)
+        else:
+            self._mark_session_pending(account)
         with self._lock:
             duplicate = self._find_account_by_identity(account)
             if duplicate:
                 account["id"] = duplicate["id"]
                 account["name"] = duplicate.get("name") or account["name"]
                 account["created_at"] = duplicate.get("created_at") or account["created_at"]
-                for key in ("mail_email", "mail_password", "mail_host", "mail_port"):
+                account["session_version"] = self._next_session_version(duplicate)
+                for key in ("mail_email", "mail_password", "mail_host", "mail_port", "imap_config_id"):
                     if duplicate.get(key) and not account.get(key):
                         account[key] = duplicate[key]
                 self.accounts[duplicate["id"]] = account
@@ -590,7 +754,7 @@ class AccountManager:
 
     def update_account_session(
         self, acc_id: str, name: str, cookie_input: str, host: str = "icloud.com",
-        group_id: Optional[str] = None,
+        group_id: Optional[str] = None, validate: bool = True,
     ) -> Dict:
         cookies = self.parse_cookie_input(cookie_input)
         with self._lock:
@@ -599,13 +763,19 @@ class AccountManager:
                 raise KeyError(f"账号不存在: {acc_id}")
             account = dict(current)
 
+        clean_host = str(host or account.get("host") or "icloud.com").strip() or "icloud.com"
         account.update({
             "name": str(name or account.get("name") or "未命名账号").strip() or "未命名账号",
             "cookies": cookies,
-            "host": str(host or account.get("host") or "icloud.com").strip() or "icloud.com",
+            "host": clean_host,
+            "session_version": self._next_session_version(account),
+            "session_fingerprint": self._session_fingerprint(cookies, clean_host),
         })
         account.pop("group_id", None)
-        self._refresh_session_state(account)
+        if validate:
+            self._refresh_session_state(account)
+        else:
+            self._mark_session_pending(account)
 
         with self._lock:
             if acc_id not in self.accounts:
@@ -637,6 +807,136 @@ class AccountManager:
             key=lambda a: (a.get("status") != "active", a.get("created_at", "")),
         )
 
+    @staticmethod
+    def _public_imap_config(config: Dict) -> Dict:
+        return {
+            "id": config.get("id", ""),
+            "name": config.get("name", ""),
+            "email": config.get("email", ""),
+            "host": config.get("host", ""),
+            "port": int(config.get("port") or 993),
+            "has_password": bool(config.get("password")),
+            "created_at": config.get("created_at", ""),
+            "updated_at": config.get("updated_at", ""),
+        }
+
+    @staticmethod
+    def _imap_config_payload(
+        name: str, email: str, password: str, host: str = "",
+        port: int = 993, existing_password: str = "",
+    ) -> Dict[str, Any]:
+        email = str(email or "").strip()
+        password = str(password or "").strip() or str(existing_password or "").strip()
+        host = str(host or "").strip() or infer_mail_host(email)
+        port = coerce_mail_port(port)
+        if not email:
+            raise ValueError("请填写 IMAP 登录邮箱")
+        if not password:
+            raise ValueError("请填写邮箱授权码或密码")
+        if not host:
+            raise ValueError("请填写 IMAP 服务器")
+        return {
+            "name": str(name or email).strip() or email,
+            "email": email,
+            "password": password,
+            "host": host,
+            "port": port,
+        }
+
+    def list_imap_configs(self) -> List[Dict]:
+        return [
+            self._public_imap_config(config)
+            for config in sorted(
+                self.imap_configs.values(),
+                key=lambda item: (str(item.get("name") or ""), str(item.get("created_at") or "")),
+            )
+        ]
+
+    def get_imap_config(self, config_id: str) -> Dict:
+        config = self.imap_configs.get(str(config_id or "").strip())
+        if not config:
+            raise KeyError(f"IMAP 配置不存在: {config_id}")
+        return self._public_imap_config(config)
+
+    def add_imap_config(self, name: str, email: str, password: str,
+                        host: str = "", port: int = 993) -> Dict:
+        now = datetime.now().isoformat()
+        config_id = self._generate_imap_config_id()
+        config = self._imap_config_payload(name, email, password, host, port)
+        config.update({"id": config_id, "created_at": now, "updated_at": now})
+        with self._lock:
+            self.imap_configs[config_id] = config
+            self._save()
+            return self._public_imap_config(config)
+
+    def update_imap_config(self, config_id: str, name: str, email: str,
+                           password: str = "", host: str = "", port: int = 993) -> Dict:
+        config_id = str(config_id or "").strip()
+        with self._lock:
+            current = self.imap_configs.get(config_id)
+            if not current:
+                raise KeyError(f"IMAP 配置不存在: {config_id}")
+            updated = self._imap_config_payload(
+                name,
+                email,
+                password,
+                host,
+                port,
+                existing_password=current.get("password", ""),
+            )
+            updated.update({
+                "id": config_id,
+                "created_at": current.get("created_at") or datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            })
+            self.imap_configs[config_id] = updated
+            self._save()
+            return self._public_imap_config(updated)
+
+    def delete_imap_config(self, config_id: str) -> bool:
+        config_id = str(config_id or "").strip()
+        if not config_id:
+            return False
+        with self._lock:
+            if config_id not in self.imap_configs:
+                return False
+            for account in self.accounts.values():
+                if account.get("imap_config_id") == config_id:
+                    raise ValueError("IMAP 配置正在被账号使用，先切换账号邮件登录")
+            del self.imap_configs[config_id]
+            self._save()
+            return True
+
+    def get_account_mail_settings(self, account_or_id: Any, include_password: bool = False) -> Dict:
+        account = self.accounts.get(account_or_id) if isinstance(account_or_id, str) else account_or_id
+        if not account:
+            raise KeyError(f"账号不存在: {account_or_id}")
+        config_id = str(account.get("imap_config_id") or "").strip()
+        config = self.imap_configs.get(config_id) if config_id else None
+        if config:
+            settings = {
+                "mail_email": config.get("email", ""),
+                "mail_host": config.get("host", ""),
+                "mail_port": int(config.get("port") or 993),
+                "imap_config_id": config_id,
+                "imap_config_name": config.get("name", ""),
+                "has_mail_config": bool(config.get("email") and config.get("host") and config.get("password")),
+            }
+            if include_password:
+                settings["mail_password"] = config.get("password", "")
+            return settings
+        settings = {
+            "mail_email": account_mail_email(account),
+            "mail_host": account_mail_host(account),
+            "mail_port": int(account.get("mail_port") or 993),
+            "imap_config_id": "",
+            "imap_config_name": "",
+            "has_mail_config": account_has_mail_config(account),
+        }
+        if include_password:
+            settings["mail_password"] = account.get("mail_password") or account.get("app_password", "")
+        return settings
+
     def update_account(self, acc_id: str, **kwargs) -> Optional[Dict]:
         with self._lock:
             if acc_id in self.accounts:
@@ -663,47 +963,38 @@ class AccountManager:
 
         return primary or apple_id
 
-    def validate_account(self, acc_id: str) -> Dict:
-        from icloud_hme import ICloudHME
+    def validate_account(self, acc_id: str, expected_session_version: Optional[int] = None) -> Dict:
+        with self._lock:
+            account = self.accounts.get(acc_id)
+            if not account:
+                raise KeyError(f"账号不存在: {acc_id}")
+            if expected_session_version is not None:
+                current_version = int(account.get("session_version") or 0)
+                if current_version != int(expected_session_version):
+                    return dict(account)
+            working = dict(account)
 
-        account = self.accounts.get(acc_id)
-        if not account:
-            raise KeyError(f"账号不存在: {acc_id}")
+        working["validation_status"] = "running"
+        working["validation_started_at"] = datetime.now().isoformat()
+        self._refresh_session_state(working)
 
-        try:
-            client = ICloudHME(
-                account["cookies"],
-                host=account.get("host", "icloud.com"),
-                verbose=False,
-            )
-            client.validate_session()
-            info = client.get_account_info()
-            if info:
-                account["real_email"] = (
-                    info.get("appleId", "")
-                    or info.get("primaryEmail", "")
-                )
-                existing = account.get("icloud_email", "")
-                is_icloud = existing and any(
-                    d in existing for d in ("@icloud.com", "@me.com", "@mac.com")
-                )
-                if not is_icloud:
-                    account["icloud_email"] = self._derive_icloud_email(info)
-
-            aliases = client.list_aliases()
-            account["alias_total"] = len(aliases)
-            account["alias_active"] = sum(
-                1 for a in aliases if a.get("active")
-            )
-            account["status"] = "active"
-            account["last_validated"] = datetime.now().isoformat()
-            account["last_error"] = None
-        except Exception as e:
-            account["status"] = "error"
-            account["last_error"] = str(e)[:300]
-
-        self._save()
-        return account
+        with self._lock:
+            current = self.accounts.get(acc_id)
+            if not current:
+                raise KeyError(f"账号不存在: {acc_id}")
+            if expected_session_version is not None:
+                current_version = int(current.get("session_version") or 0)
+                if current_version != int(expected_session_version):
+                    return dict(current)
+            duplicate = self._find_account_by_identity(working)
+            if duplicate and duplicate.get("id") != acc_id:
+                working["status"] = "error"
+                working["validation_status"] = "error"
+                label = duplicate.get("name") or duplicate.get("real_email") or duplicate.get("id")
+                working["last_error"] = f"该会话属于已存在账号: {label}"
+            self.accounts[acc_id] = working
+            self._save()
+            return dict(working)
 
     def validate_all(self) -> List[Dict]:
         results: List[Dict] = []
@@ -743,37 +1034,57 @@ class AccountManager:
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
-        mail_email = account_mail_email(account)
-        mail_host = account_mail_host(account)
-        mail_port = int(account.get("mail_port") or 993)
-        mail_password = account.get("mail_password") or account.get("app_password", "")
+        settings = self.get_account_mail_settings(account, include_password=True)
+        mail_email = settings.get("mail_email", "")
+        mail_host = settings.get("mail_host", "")
+        mail_port = settings.get("mail_port") or 993
+        mail_password = settings.get("mail_password", "")
         if not mail_email or not mail_host or not mail_password:
             raise ValueError("邮件读取未配置，请在账号卡片中设置邮件登录")
         return ICloudMail(mail_email, mail_password, verbose=verbose, server=mail_host, port=mail_port)
 
     def set_mail_settings(self, acc_id: str, email: str, password: str,
-                          host: str = "", port: int = 993) -> Dict:
-        email = str(email or "").strip()
-        password = str(password or "").strip()
-        host = str(host or "").strip() or infer_mail_host(email)
-        port = int(port or 993)
-        if not email:
-            raise ValueError("请填写邮件登录邮箱")
-        if not password:
-            raise ValueError("请填写邮箱授权码或密码")
-        if not host:
-            raise ValueError("请填写 IMAP 服务器")
+                          host: str = "", port: int = 993,
+                          imap_config_id: str = "") -> Dict:
+        imap_config_id = str(imap_config_id or "").strip()
         with self._lock:
             if acc_id not in self.accounts:
                 raise KeyError(f"账号不存在: {acc_id}")
-            self.accounts[acc_id].update({
-                "mail_email": email,
-                "mail_password": password,
-                "mail_host": host,
-                "mail_port": port,
+            account = self.accounts[acc_id]
+            if imap_config_id:
+                if imap_config_id not in self.imap_configs:
+                    raise KeyError(f"IMAP 配置不存在: {imap_config_id}")
+                account["imap_config_id"] = imap_config_id
+                self._save()
+                return dict(account)
+
+            payload = self._imap_config_payload(email, email, password, host, port)
+            account.update({
+                "mail_email": payload["email"],
+                "mail_password": payload["password"],
+                "mail_host": payload["host"],
+                "mail_port": payload["port"],
             })
+            account.pop("imap_config_id", None)
             self._save()
-            return dict(self.accounts[acc_id])
+            return dict(account)
+
+    def test_imap_config(self, config_id: str) -> Dict:
+        from icloud_mail import ICloudMail
+
+        config = self.imap_configs.get(str(config_id or "").strip())
+        if not config:
+            raise KeyError(f"IMAP 配置不存在: {config_id}")
+        mail = ICloudMail(
+            config.get("email", ""),
+            config.get("password", ""),
+            server=config.get("host", ""),
+            port=config.get("port") or 993,
+        )
+        result = mail.test_connection()
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "邮件读取暂不可用"}
+        return result
 
     def test_mail_connection(self, acc_id: str) -> Dict:
         mail = self.get_mail_client(acc_id)
@@ -782,20 +1093,78 @@ class AccountManager:
             return {"ok": False, "error": result.get("error") or "邮件读取暂不可用"}
         return result
 
+    def test_mail_read(self, acc_id: str, alias_email: str = "",
+                       limit: int = 5, days: int = 7) -> Dict:
+        alias_email = str(alias_email or "").strip()
+        limit = max(1, min(int(limit or 5), 20))
+        days = max(1, min(int(days or 7), 90))
+        try:
+            result = self.test_mail_connection(acc_id)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200] or "邮件读取暂不可用"}
+        if not result.get("ok"):
+            return result
+
+        mail = self.get_mail_client(acc_id)
+        try:
+            if alias_email:
+                messages = mail.find_by_recipient(alias_email, limit=limit, days=days)
+            else:
+                messages = mail.check_inbox(limit=limit, days=days)
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = str(e)[:200] or "邮件读取暂不可用"
+            result["alias"] = alias_email
+            result["days"] = days
+            result["recent_count"] = 0
+            result["messages"] = []
+            return result
+        finally:
+            try:
+                mail.disconnect()
+            except Exception:
+                pass
+
+        result.update({
+            "ok": True,
+            "alias": alias_email,
+            "days": days,
+            "limit": limit,
+            "recent_count": len(messages),
+            "messages": messages[:limit],
+        })
+        if messages:
+            result["message"] = f"IMAP 正常，读取到 {len(messages)} 封邮件"
+        else:
+            scope = f"发给 {alias_email} 的" if alias_email else ""
+            result["message"] = f"IMAP 正常，但最近 {days} 天没有读取到{scope}邮件"
+        return result
+
     def check_inbox(self, acc_id: str, limit: int = 50, days: int = 7,
                     force: bool = False) -> List[Dict]:
+        limit = max(1, min(int(limit or 50), 100))
+        days = max(1, min(int(days or 7), 90))
         cached = self._cache.get_inbox(acc_id)
         age = self._cache.cache_age_seconds(acc_id)
 
         if not force and cached and age < 300:
             return cached[-limit:]
 
+        mail = None
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.check_inbox(limit=50, days=days)
-            mail.disconnect()
-        except Exception:
-            new_msgs = []
+            new_msgs = mail.check_inbox(limit=limit, days=days)
+        except Exception as e:
+            cached = self._cache.get_inbox(acc_id)
+            if cached:
+                return cached[-limit:]
+            raise RuntimeError(str(e) or "邮件读取暂不可用") from e
+        finally:
+            if mail:
+                try:
+                    mail.disconnect()
+                except Exception:
+                    pass
 
         if new_msgs:
             self._cache.set_inbox(acc_id, new_msgs)
@@ -805,18 +1174,29 @@ class AccountManager:
     def check_alias_mail(self, acc_id: str, alias_email: str,
                          limit: int = 20, days: int = 30,
                          force: bool = False) -> List[Dict]:
+        limit = max(1, min(int(limit or 20), 100))
+        days = max(1, min(int(days or 30), 90))
         cached = self._cache.get_alias_mail(acc_id, alias_email)
         age = self._cache.cache_age_seconds(acc_id)
 
         if not force and cached and age < 300:
             return cached[-limit:]
 
+        mail = None
         try:
             mail = self.get_mail_client(acc_id)
-            new_msgs = mail.find_by_recipient(alias_email, limit=20, days=days)
-            mail.disconnect()
-        except Exception:
-            new_msgs = []
+            new_msgs = mail.find_by_recipient(alias_email, limit=limit, days=days)
+        except Exception as e:
+            cached = self._cache.get_alias_mail(acc_id, alias_email)
+            if cached:
+                return cached[-limit:]
+            raise RuntimeError(str(e) or "邮件读取暂不可用") from e
+        finally:
+            if mail:
+                try:
+                    mail.disconnect()
+                except Exception:
+                    pass
 
         if new_msgs:
             self._cache.set_alias_mail(acc_id, alias_email, new_msgs)

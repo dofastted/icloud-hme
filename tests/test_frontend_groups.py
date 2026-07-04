@@ -133,7 +133,7 @@ const elements = {
 const S = {
   accounts: [],
   groups: [
-    {id: 'grp_default', name: '默认分组', color: '#1f8b4c', is_default: true},
+    {id: 'grp_default', name: '可用', color: '#1f8b4c', is_default: true, is_system: true},
     {id: maliciousId, name: maliciousName, color: '#123456'},
   ],
   mailboxes: [],
@@ -174,6 +174,43 @@ vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context
   }
   if (requestedBody.group_id !== maliciousId || requestedBody.alias_emails[0] !== 'alias@icloud.com') {
     throw new Error('wrong move payload: ' + JSON.stringify(requestedBody));
+  }
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    run_node(script)
+
+def test_group_page_marks_system_status_groups_readonly():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+const S = {
+  groups: [],
+  E(){ return {innerHTML: ''}; },
+  esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); },
+  inlineArg(value){ return this.esc(JSON.stringify(value)); },
+  setTitle(){},
+  loading(){ return 'loading'; },
+  error(err){ return String(err.message || err); },
+  view(html){ rendered = html; },
+  async api(path){
+    if (path !== '/api/groups') throw new Error('unexpected api ' + path);
+    return {ok:true, groups:[
+      {id:'grp_default', name:'可用', color:'#1f8b4c', is_default:true, is_system:true, mailbox_count:1},
+      {id:'grp_unavailable', name:'不可用', color:'#d97706', is_system:true, mailbox_count:2},
+      {id:'grp_deprecated', name:'废弃', color:'#6b7280', is_system:true, mailbox_count:3},
+      {id:'grp_custom', name:'Custom', color:'#123456', mailbox_count:0},
+    ]};
+  },
+};
+const context = {window: {HME: S}, encodeURIComponent, confirm(){ return true; }, console};
+vm.runInNewContext(fs.readFileSync('static/js/07-groups.js', 'utf8'), context);
+(async () => {
+  await S.renderGroups();
+  const readonlyCount = (rendered.match(/内置状态分组/g) || []).length;
+  if (readonlyCount !== 3) throw new Error('system groups are not readonly: ' + rendered);
+  if (!rendered.includes('HME.showGroupModal(&quot;grp_custom&quot;)')) {
+    throw new Error('custom group edit action missing: ' + rendered);
   }
 })().catch(err => { console.error(err.stack || err.message); process.exit(1); });
 '''

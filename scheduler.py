@@ -21,7 +21,7 @@ from typing import Optional, Dict, List
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
-from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh
 
 LOG_DIR = HERE / "logs"
 RESULT_DIR = HERE / "results"
@@ -60,7 +60,14 @@ def is_limit_error(error: str) -> bool:
     return any(kw in error.lower() for kw in LIMIT_KEYWORDS)
 
 
+
+
+def _interruptible_sleep(seconds: float):
+    time.sleep(max(0.0, float(seconds or 0)))
+
 def refresh_scheduler_account_count(mgr: AccountManager, account: Dict, logger: logging.Logger) -> Dict:
+    if not scheduler_count_needs_refresh(account):
+        return account
     acc_id = account["id"]
     try:
         aliases = mgr.get_aliases_for_account(acc_id)
@@ -104,7 +111,7 @@ def run_one_round(mgr: AccountManager, logger: logging.Logger, label: str = "", 
                         created += 1; round_result.created.append(r["email"])
                         round_result.created_by_account[acc_id] = round_result.created_by_account.get(acc_id, 0) + 1
                         errors = 0; logger.info(f"created ({created}/{target_count}) {r['email']}")
-                        time.sleep(_random.uniform(10, 30))
+                        _interruptible_sleep(_random.uniform(10, 30))
                     else:
                         errors += 1
                         if is_limit_error(r.get("error","")): logger.info(f"limit hit: {r.get('error','')[:60]}"); break
@@ -114,7 +121,7 @@ def run_one_round(mgr: AccountManager, logger: logging.Logger, label: str = "", 
                 if is_limit_error(err_str): logger.info(f"limit hit: {err_str[:60]}"); break
                 if any(kw in err_str.lower() for kw in ["401","403","cookie","session","validate"]):
                     logger.error(f"fatal {acc_name}: {err_str[:200]}"); mgr.update_account(acc_id, status="error", last_error=err_str[:300]); round_result.fatal_error = err_str; break
-        if i < len(active_accounts) - 1: time.sleep(_random.uniform(120, 300))
+        if i < len(active_accounts) - 1: _interruptible_sleep(_random.uniform(120, 300))
     round_result.hit_limit = any(is_limit_error(e.get("error","")) for e in round_result.errors)
     round_result.end_time = datetime.now()
     summary = ", ".join(f"{mgr.accounts[aid].get('name',aid)[:12]}: {n}" for aid, n in round_result.created_by_account.items()) if round_result.created_by_account else "0"

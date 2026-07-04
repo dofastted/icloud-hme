@@ -42,7 +42,7 @@ python web_ui.py --scheduler        # 启动 Web 后自动开启调度器
 | 模块 | 功能 |
 |------|------|
 | **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话 |
-| **邮箱分组** | 创建/编辑/删除 HME 邮箱分组，自定义颜色，删除分组时邮箱回到默认分组 |
+| **邮箱分组** | 默认内置“可用 / 不可用 / 废弃”三类 HME 邮箱分组，支持新增自定义分组 |
 | **仪表盘** | 账号总数、总别名数、今日创建数，每账号一张状态卡片 |
 | **别名列表** | 实时拉取所有别名，标注所属账号和邮箱分组，支持按分组筛选与移动 |
 | **邮箱详情** | 搜索单个 HME 邮箱，查看最新邮件，按需移动分组或展开正文 |
@@ -152,7 +152,7 @@ curl "http://127.0.0.1:5050/api/v1/hme/alias@icloud.com/latest?force=1" \
 
 管理端 UI 使用 `/api/mailboxes*` 与 `/api/shared*`，沿用本地管理端边界，不要求 API Key。不要把管理端口直接暴露到公网。
 
-邮件读取依赖 HME 的接收邮箱。账号卡片中的“邮件登录”应填写接收邮箱、IMAP 服务器和邮箱授权码或密码；QQ 邮箱常用 `imap.qq.com`，163 邮箱常用 `imap.163.com`。未配置或登录失败时，HME 管理仍可用，但邮件内容读取会返回 `邮件读取暂不可用`。
+邮件读取依赖 HME 的接收邮箱。侧边栏“IMAP 配置”可保存多个接收邮箱 IMAP 登录；账号卡片中的“邮件登录”可新建 IMAP 配置或选择已保存配置。QQ 邮箱常用 `imap.qq.com`，163 邮箱常用 `imap.163.com`。未配置或登录失败时，HME 管理仍可用，但邮件内容读取会返回 `邮件读取暂不可用`。
 
 别名对象字段对齐 Apple HME：`hme`、`label`、`note`、`isActive`、`createTimestamp`、`anonymousId`、`forwardToEmail`、`origin`。
 
@@ -239,7 +239,7 @@ curl -X POST http://127.0.0.1:5050/api/shared/latest \
 运行时生成：
 
 ```
-accounts.json          # 所有账号、邮箱分组、邮箱-分组映射及 Cookie（自动持久化）
+accounts.json          # 所有账号、IMAP 配置、邮箱分组、邮箱-分组映射及 Cookie（自动持久化）
 shared_mailboxes.json  # shared key 摘要、prefix、访问统计
 scheduler_state.json   # 调度器历史状态
 logs/                  # 运行日志

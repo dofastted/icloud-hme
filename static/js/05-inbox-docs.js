@@ -1,11 +1,13 @@
 (function(){
   const S = window.HME;
+  S.logPaused = false;
 
   S.renderBatch = function(){
     S.setTitle('批量创建');
     const checks = S.accounts.map(a => '<label><input type="checkbox" name="batchAcc" value="' + S.esc(a.id) + '"> ' + S.esc(a.name || a.id) + '</label>').join('<br>');
     S.view('<div class="panel"><div class="panel-head">批量创建</div><div class="panel-body">' + (checks || S.empty('暂无账号')) + '<div style="height:14px"></div><input id="batchCount" type="number" min="1" max="20" value="1"> <input id="batchLabel" placeholder="标签，可选"> <button class="btn" onclick="HME.runBatch()">开始创建</button><div id="batchResult" class="muted mono" style="margin-top:14px"></div></div></div>');
   };
+
   S.runBatch = async function(){
     try {
       const account_ids = Array.from(document.querySelectorAll('input[name=batchAcc]:checked')).map(x => x.value);
@@ -16,22 +18,54 @@
     } catch (err) { S.E('batchResult').textContent = err.message; }
   };
 
+  function inboxTable(msgs){
+    return '<table class="table"><tbody>' + msgs.map(m => '<tr><td><strong>' + S.esc(m.subject || '(无主题)') + '</strong><br><span class="muted">' + S.esc(m.from || '') + '</span><br><span class="muted mono">To: ' + S.esc(m.to || '') + '</span></td><td>' + S.esc(m.date || '') + '</td></tr>').join('') + '</tbody></table>';
+  }
+
+  function renderImapTest(mail){
+    const messages = mail.messages || [];
+    const status = mail.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">FAIL</span>';
+    const rows = [
+      '邮箱: ' + (mail.email || ''),
+      '服务器: ' + (mail.server || '') + ':' + (mail.port || ''),
+      'INBOX 总数: ' + (mail.inbox_count == null ? '-' : mail.inbox_count),
+      '最近读取: ' + (mail.recent_count || 0),
+      '范围: 最近 ' + (mail.days || '-') + ' 天'
+    ].map(S.esc).join('<br>');
+    const detail = mail.error ? '<div class="warning">' + S.esc(mail.error) + '</div>' : '<p class="muted">' + S.esc(mail.message || '') + '</p>';
+    return '<div class="card"><h3>IMAP 测试 ' + status + '</h3><p class="muted mono">' + rows + '</p>' + detail + (messages.length ? inboxTable(messages) : '') + '</div>';
+  }
+
   S.renderInbox = function(){
     S.setTitle('收件箱');
     const options = '<option value="">选择账号</option>' + S.accounts.map(a => '<option value="' + S.esc(a.id) + '">' + S.esc(a.name || a.id) + '</option>').join('');
-    S.view('<div class="panel"><div class="panel-head">收件箱</div><div class="panel-body"><select id="inboxAccount">' + options + '</select> <input id="inboxAlias" placeholder="可选：指定 alias@icloud.com"> <button class="btn btn-outline btn-sm" onclick="HME.loadInbox()">读取</button><div id="inboxResult" style="margin-top:16px">' + S.empty('请选择账号后读取') + '</div></div></div>');
+    S.view('<div class="panel"><div class="panel-head">收件箱</div><div class="panel-body"><select id="inboxAccount">' + options + '</select> <input id="inboxAlias" placeholder="可选：指定 alias@icloud.com"> <button class="btn btn-outline btn-sm" onclick="HME.testInboxImap()">测试 IMAP</button> <button class="btn btn-outline btn-sm" onclick="HME.loadInbox()">读取</button><div id="inboxResult" style="margin-top:16px">' + S.empty('请选择账号后读取') + '</div></div></div>');
   };
+
   S.loadInbox = async function(){
     const acc = S.E('inboxAccount').value;
     const alias = S.E('inboxAlias').value.trim();
     if (!acc) { S.E('inboxResult').innerHTML = S.empty('请先选择账号'); return; }
     S.E('inboxResult').innerHTML = S.loading(3);
     try {
-      const path = alias ? '/api/accounts/' + encodeURIComponent(acc) + '/mail/' + encodeURIComponent(alias) + '?limit=20' : '/api/accounts/' + encodeURIComponent(acc) + '/inbox?limit=20';
+      const path = alias ? '/api/accounts/' + encodeURIComponent(acc) + '/mail/' + encodeURIComponent(alias) + '?limit=20&force=1' : '/api/accounts/' + encodeURIComponent(acc) + '/inbox?limit=20&force=1';
       const data = await S.api(path);
       const msgs = data.emails || [];
-      if (!msgs.length) { S.E('inboxResult').innerHTML = S.empty(data.error || '暂无邮件'); return; }
-      S.E('inboxResult').innerHTML = '<table class="table"><tbody>' + msgs.map(m => '<tr><td><strong>' + S.esc(m.subject || '(无主题)') + '</strong><br><span class="muted">' + S.esc(m.from || '') + '</span></td><td>' + S.esc(m.date || '') + '</td></tr>').join('') + '</tbody></table>';
+      if (!msgs.length) { S.E('inboxResult').innerHTML = data.error ? S.error(data.error) : S.empty('暂无邮件，可点击“测试 IMAP”检查连接'); return; }
+      S.E('inboxResult').innerHTML = inboxTable(msgs);
+    } catch (err) { S.E('inboxResult').innerHTML = S.error(err); }
+  };
+
+  S.testInboxImap = async function(){
+    const acc = S.E('inboxAccount').value;
+    const alias = S.E('inboxAlias').value.trim();
+    if (!acc) { S.E('inboxResult').innerHTML = S.empty('请先选择账号'); return; }
+    S.E('inboxResult').innerHTML = S.loading(2);
+    try {
+      const res = await fetch('/api/accounts/' + encodeURIComponent(acc) + '/mail-settings/test', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias, limit:5, days:alias ? 30 : 7})});
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      S.E('inboxResult').innerHTML = renderImapTest(data.mail || {ok:false,error:data.error || '测试失败'});
     } catch (err) { S.E('inboxResult').innerHTML = S.error(err); }
   };
 
@@ -63,23 +97,60 @@
     S.view('<p class="muted">管理端口不应直接暴露公网；外部自动化请使用 API Key；shared 入口使用兑换码。</p>' + html);
   };
 
+  function logLine(entry){
+    const level = S.esc(entry.level || 'info');
+    return '<div class="log-line log-' + level + '"><span class="muted">' + S.esc(entry.time || '') + '</span> <span class="badge ' + (level === 'warn' || level === 'error' ? 'err' : 'ok') + '">' + level + '</span> ' + S.esc(entry.msg || '') + '</div>';
+  }
+
+  function appendLog(entry){
+    S.logs.push(entry);
+    if (S.logs.length > 300) S.logs = S.logs.slice(-300);
+    const feed = S.E('logFeed');
+    if (!feed || !(location.hash || '').startsWith('#/logs') || S.logPaused) return;
+    if (feed.innerHTML && feed.innerHTML.includes('empty')) feed.innerHTML = '';
+    feed.insertAdjacentHTML('beforeend', logLine(entry));
+    feed.scrollTop = feed.scrollHeight;
+  }
+
   S.renderLogs = function(){
     S.setTitle('运行日志');
-    S.view('<div class="panel"><div class="panel-head"><span>运行日志</span><button class="btn btn-outline btn-sm" onclick="HME.logs=[];HME.renderLogs()">清空</button></div><div class="panel-body mono" id="logFeed">' + (S.logs.length ? S.logs.map(l => '<div>' + S.esc(l.time) + ' ' + S.esc(l.level) + ' ' + S.esc(l.msg) + '</div>').join('') : S.empty('等待日志')) + '</div></div>');
+    const rows = S.logs.length ? S.logs.map(logLine).join('') : S.empty('等待日志');
+    const pauseLabel = S.logPaused ? '继续' : '暂停';
+    S.view('<div class="panel"><div class="panel-head"><span>运行日志</span><span><button class="btn btn-outline btn-sm" onclick="HME.loadLogHistory()">加载历史</button> <button class="btn btn-outline btn-sm" onclick="HME.toggleLogPause()">' + pauseLabel + '</button> <button class="btn btn-outline btn-sm" onclick="HME.clearLogs()">清空</button></span></div><div class="panel-body mono" id="logFeed">' + rows + '</div></div>');
+    const feed = S.E('logFeed');
+    if (feed) feed.scrollTop = feed.scrollHeight;
+  };
+
+  S.clearLogs = function(){
+    S.logs = [];
+    S.renderLogs();
+  };
+
+  S.toggleLogPause = function(){
+    S.logPaused = !S.logPaused;
+    S.renderLogs();
+  };
+
+  S.loadLogHistory = async function(){
+    if (typeof fetch !== 'function') return;
+    try {
+      const res = await fetch('/api/logs?limit=200');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
+      S.logs = data.logs || [];
+      if ((location.hash || '').startsWith('#/logs')) S.renderLogs();
+    } catch (err) { S.toast && S.toast(err.message, true); }
   };
 
   function connectLogs(){
     try {
       const es = new EventSource('/api/log-stream');
       es.onmessage = (event) => {
-        try {
-          S.logs.push(JSON.parse(event.data));
-          if (S.logs.length > 300) S.logs = S.logs.slice(-300);
-          if ((location.hash || '').startsWith('#/logs')) S.renderLogs();
-        } catch (_) {}
+        try { appendLog(JSON.parse(event.data)); } catch (_) {}
       };
       es.onerror = () => { es.close(); setTimeout(connectLogs, 5000); };
     } catch (_) {}
   }
+
   connectLogs();
 })();

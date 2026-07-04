@@ -120,6 +120,24 @@ class MailboxService:
     def refresh_mailboxes(self) -> List[Dict]:
         return self.list_mailboxes(refresh=True)
 
+    def local_metadata(self) -> Dict:
+        index_updated_at = None
+        index_count = 0
+        if self.index_path.exists():
+            try:
+                data = json.loads(self.index_path.read_text(encoding="utf-8"))
+                index_updated_at = data.get("updated_at") if isinstance(data, dict) else None
+                mailboxes = data.get("mailboxes", {}) if isinstance(data, dict) else {}
+                index_count = len(mailboxes) if isinstance(mailboxes, (dict, list)) else 0
+            except (json.JSONDecodeError, OSError):
+                index_updated_at = None
+        return {
+            "source": "local",
+            "index_updated_at": index_updated_at,
+            "local_alias_count": len(self._load_local_aliases()),
+            "index_alias_count": index_count,
+        }
+
     def get_mailbox(self, alias_email: str) -> Dict:
         _account, meta = self.resolve_alias(alias_email)
         return meta
@@ -245,7 +263,7 @@ class MailboxService:
             aliases = self.account_mgr.get_all_aliases()
         except Exception as exc:
             raise IMAPUnavailable(str(exc) or "mailbox sync unavailable") from exc
-        return list(aliases or [])
+        return [dict(alias, source="remote") for alias in (aliases or [])]
 
     def _load_index(self) -> List[Dict]:
         if not self.index_path.exists():
@@ -266,7 +284,9 @@ class MailboxService:
         accounts = {a.get("id"): a for a in self.account_mgr.list_accounts()}
         by_alias: Dict[str, Dict] = {}
         for alias_data in aliases:
-            self._merge_source(by_alias, accounts, alias_data)
+            item = dict(alias_data)
+            item.setdefault("source", "remote")
+            self._merge_source(by_alias, accounts, item)
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self.index_path.write_text(
             json.dumps(
@@ -292,6 +312,7 @@ class MailboxService:
             items.append({
                 "alias_email": _normalize_alias(parts[0]),
                 "account_id": parts[1] if len(parts) > 1 else "",
+                "source": "local",
             })
         return items
 
@@ -339,6 +360,7 @@ class MailboxService:
             **group_fields,
             "is_active": bool(is_active),
             "created_at": source.get("createTimestamp") or source.get("createdAt") or source.get("created_at") or "",
+            "source": source.get("source") or "local",
             "shared": None,
         }
 

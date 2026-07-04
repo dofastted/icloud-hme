@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
 import sys, os, json, time, queue, secrets, threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import wraps
@@ -11,7 +12,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
 from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
 from shared_mailboxes import SharedMailboxStore
@@ -27,9 +28,16 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 _log_queue = queue.Queue()
+_log_buffer = deque(maxlen=500)
+_log_lock = threading.Lock()
+_log_seq = 0
 _today_key = datetime.now().strftime("%Y%m%d")
 _global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
 _lock = threading.Lock()
+_validation_queue = queue.Queue()
+_validation_thread = None
+_validation_lock = threading.Lock()
+_validation_jobs = {}
 _scheduler_thread = None
 _stop_event = threading.Event()
 _account_mgr = AccountManager()
@@ -77,12 +85,25 @@ def _require_api_key(fn):
     return wrapper
 
 def _safe_account(account):
-    safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password","group_id","group_name","group_color")}
-    safe["has_mail_config"] = account_has_mail_config(account)
-    safe["mail_email"] = account_mail_email(account)
-    safe["mail_host"] = account_mail_host(account)
-    safe["mail_port"] = int(account.get("mail_port") or 993)
+    safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password","group_id","group_name","group_color","session_fingerprint")}
+    get_settings = getattr(_account_mgr, "get_account_mail_settings", None)
+    if callable(get_settings):
+        settings = get_settings(account)
+        safe.update(settings)
+    else:
+        safe["has_mail_config"] = account_has_mail_config(account)
+        safe["mail_email"] = account_mail_email(account)
+        safe["mail_host"] = account_mail_host(account)
+        safe["mail_port"] = int(account.get("mail_port") or 993)
+        safe["imap_config_id"] = ""
+        safe["imap_config_name"] = ""
     return safe
+
+def _list_imap_configs_safe():
+    list_configs = getattr(_account_mgr, "list_imap_configs", None)
+    if not callable(list_configs):
+        return []
+    return list_configs()
 
 def _list_groups_safe():
     list_groups = getattr(_account_mgr, "list_groups", None)
@@ -142,6 +163,47 @@ def _optional_int(value):
     if value in (None, ""):
         return None
     return int(value)
+
+def _set_mail_settings_for_account(acc_id, data):
+    imap_config_id = data.get("imap_config_id") or ""
+    if imap_config_id:
+        return _account_mgr.set_mail_settings(
+            acc_id,
+            "",
+            "",
+            "",
+            993,
+            imap_config_id=imap_config_id,
+        )
+    return _account_mgr.set_mail_settings(
+        acc_id,
+        data.get("email") or data.get("mail_email") or "",
+        data.get("password") or data.get("mail_password") or "",
+        data.get("host") or data.get("mail_host") or "",
+        data.get("port") or data.get("mail_port") or 993,
+    )
+
+def _mail_settings_response(account, result):
+    ok = bool(result.get("ok"))
+    payload = {"ok":ok,"account":_safe_account(account),"mail":result}
+    if not ok:
+        payload["error"] = result.get("error") or "邮件读取暂不可用"
+    return jsonify(payload)
+
+def _mail_test_request():
+    data = request.get_json(silent=True) or {}
+    alias = str(data.get("alias") or request.args.get("alias", "") or "").strip()
+    limit = min(max(int(data.get("limit") or request.args.get("limit", 5, type=int) or 5), 1), 20)
+    days = min(max(int(data.get("days") or request.args.get("days", 7, type=int) or 7), 1), 90)
+    return alias, limit, days
+
+def _mail_test_response(acc_id):
+    alias, limit, days = _mail_test_request()
+    result = _account_mgr.test_mail_read(acc_id, alias_email=alias, limit=limit, days=days)
+    payload = {"ok":bool(result.get("ok")),"mail":result}
+    if not payload["ok"]:
+        payload["error"] = result.get("error") or "邮件读取暂不可用"
+    return jsonify(payload)
 
 def _shared_entry_url() -> str:
     exact = os.environ.get("SHARED_PUBLIC_URL", "").strip()
@@ -265,7 +327,80 @@ def _next_scheduler_window_start(now: datetime | None = None) -> datetime:
         return current.replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
     return (current + timedelta(days=1)).replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
 
-def _emit_log(level, msg): _log_queue.put({"time":_now().strftime("%H:%M:%S"),"level":level,"msg":msg})
+def _emit_log(level, msg):
+    global _log_seq
+    entry = {"time":_now().strftime("%H:%M:%S"),"level":level,"msg":msg}
+    with _log_lock:
+        _log_seq += 1
+        entry["seq"] = _log_seq
+        _log_buffer.append(dict(entry))
+    _log_queue.put(entry)
+
+
+def _log_entries(limit: int = 200, since: int = 0):
+    limit = max(1, min(int(limit or 200), 500))
+    since = max(0, int(since or 0))
+    with _log_lock:
+        entries = [dict(item) for item in _log_buffer if int(item.get("seq") or 0) > since]
+    return entries[-limit:]
+
+
+def _start_validation_worker():
+    global _validation_thread
+    with _validation_lock:
+        if _validation_thread and _validation_thread.is_alive():
+            return
+        _validation_thread = threading.Thread(target=_validation_loop, daemon=True)
+        _validation_thread.start()
+
+
+def _queue_account_validation(acc_id: str, reason: str = "manual") -> bool:
+    account = _account_mgr.get_account(acc_id)
+    if not account:
+        raise KeyError(f"账号不存在: {acc_id}")
+    version = int(account.get("session_version") or 0)
+    with _validation_lock:
+        if _validation_jobs.get(acc_id) == version:
+            return False
+        _validation_jobs[acc_id] = version
+    _account_mgr.update_account(
+        acc_id,
+        validation_status="queued",
+        validation_queued_at=_now().isoformat(),
+    )
+    _start_validation_worker()
+    _validation_queue.put({"account_id":acc_id,"version":version,"reason":reason})
+    return True
+
+
+def _validation_loop():
+    while True:
+        job = _validation_queue.get()
+        acc_id = job.get("account_id", "")
+        version = int(job.get("version") or 0)
+        try:
+            account = _account_mgr.get_account(acc_id)
+            if not account or int(account.get("session_version") or 0) != version:
+                continue
+            _account_mgr.update_account(
+                acc_id,
+                validation_status="running",
+                validation_started_at=_now().isoformat(),
+            )
+            _emit_log("info", f"后台校验开始 [{account.get('name', acc_id)}]")
+            updated = _account_mgr.validate_account(acc_id, expected_session_version=version)
+            label = updated.get("name") or acc_id
+            if updated.get("status") == "active":
+                _emit_log("success", f"后台校验通过 [{label}]")
+            else:
+                _emit_log("warn", f"后台校验失败 [{label}]: {str(updated.get('last_error') or '')[:100]}")
+        except Exception as exc:
+            _emit_log("warn", f"后台校验异常 [{acc_id}]: {str(exc)[:100]}")
+        finally:
+            with _validation_lock:
+                if _validation_jobs.get(acc_id) == version:
+                    del _validation_jobs[acc_id]
+            _validation_queue.task_done()
 
 def _update_state(**kw):
     global _today_key
@@ -282,6 +417,8 @@ def _increment_state(**kw):
         for k, delta in kw.items(): _global_state[k] = _global_state.get(k,0) + delta
 
 def _refresh_scheduler_account_count(account: dict) -> dict:
+    if not scheduler_count_needs_refresh(account):
+        return account
     acc_id = account["id"]
     try:
         aliases = _account_mgr.get_aliases_for_account(acc_id)
@@ -353,7 +490,9 @@ def _scheduler_loop():
                     _increment_state(today_created=1, total_created=1)
                     account["alias_total"] = account.get("alias_total",0)+1
                     account["alias_active"] = account.get("alias_active",0)+1
-                    errors = 0; time.sleep(_random.uniform(15,45))
+                    errors = 0
+                    if _stop_event.wait(_random.uniform(15,45)):
+                        break
                     continue
                 errors += 1
                 if _is_limit_error(message):
@@ -363,7 +502,7 @@ def _scheduler_loop():
                     break
                 _update_state(last_error=message[:300])
                 _emit_log("warn",f"[{acc_name}] 失败: {message[:80]}")
-            if i < len(active_accounts)-1: time.sleep(_random.uniform(120,300))
+            if i < len(active_accounts)-1 and _stop_event.wait(_random.uniform(120,300)): break
         status = f"本轮创建 {round_total} 个" + (f"；{round_note}" if round_note else "")
         _update_state(creating=False, current_round_created=round_total, round_status=status)
         interval_sec = _random.randint(3600,5400)
@@ -380,9 +519,12 @@ def _health_loop():
         if _stop_event.wait(300): break
         for account in _account_mgr.list_accounts():
             if account.get("status") != "active": continue
-            try: _account_mgr.validate_account(account["id"]); _error_reported.discard(account["id"])
+            try:
+                queued = _queue_account_validation(account["id"], "health")
+                if queued:
+                    _error_reported.discard(account["id"])
             except Exception as e:
-                if account["id"] not in _error_reported: _emit_log("warn",f"健康检查失败 [{account.get('name','?')}]: {str(e)[:100]}"); _error_reported.add(account["id"])
+                if account["id"] not in _error_reported: _emit_log("warn",f"健康检查排队失败 [{account.get('name','?')}]: {str(e)[:100]}"); _error_reported.add(account["id"])
 
 # ----- Flask Routes -----
 
@@ -417,7 +559,8 @@ def api_v1_accounts():
         item["has_cookies"] = bool(account.get("cookies"))
         accounts.append(item)
     groups = _groups_with_mailbox_counts()
-    return jsonify({"ok":True,"accounts":accounts,"count":len(accounts),"groups":groups})
+    imap_configs = _list_imap_configs_safe()
+    return jsonify({"ok":True,"accounts":accounts,"count":len(accounts),"groups":groups,"imap_configs":imap_configs})
 
 @app.route("/api/v1/accounts", methods=["POST"])
 @_require_api_key
@@ -430,29 +573,34 @@ def api_v1_add_account():
         data.get("name", "未命名账号"),
         cookie_input,
         data.get("host", "icloud.com"),
+        validate=False,
     )
-    return jsonify({"ok":True,"account":_safe_account(account)})
+    queued = _queue_account_validation(account["id"], "api-add")
+    return jsonify({"ok":True,"queued":queued,"account":_safe_account(_account_mgr.get_account(account["id"]) or account)})
 
 @app.route("/api/v1/accounts/<acc_id>/session/validate", methods=["POST"])
 @_require_api_key
 def api_v1_validate_session(acc_id):
-    account = _account_mgr.validate_account(acc_id)
-    return jsonify({"ok":account.get("status")=="active","account":_safe_account(account)})
+    queued = _queue_account_validation(acc_id, "api-validate")
+    account = _account_mgr.get_account(acc_id) or {}
+    return jsonify({"ok":True,"queued":queued,"account":_safe_account(account)})
 
 @app.route("/api/v1/accounts/<acc_id>/mail-settings", methods=["POST"])
 @_require_api_key
 def api_v1_set_mail_settings(acc_id):
     data = request.get_json() or {}
     try:
-        account = _account_mgr.set_mail_settings(
-            acc_id,
-            data.get("email") or data.get("mail_email") or "",
-            data.get("password") or data.get("mail_password") or "",
-            data.get("host") or data.get("mail_host") or "",
-            data.get("port") or data.get("mail_port") or 993,
-        )
+        account = _set_mail_settings_for_account(acc_id, data)
         result = _account_mgr.test_mail_connection(acc_id)
-        return jsonify({"ok":bool(result.get("ok")),"account":_safe_account(account),"mail":result})
+        return _mail_settings_response(account, result)
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/v1/accounts/<acc_id>/mail-settings/test", methods=["GET", "POST"])
+@_require_api_key
+def api_v1_test_mail_settings(acc_id):
+    try:
+        return _mail_test_response(acc_id)
     except Exception as e:
         return jsonify({"ok":False,"error":str(e)}), 400
 
@@ -619,7 +767,9 @@ def _mailbox_list_payload():
     )
     total = len(items)
     page, limit, offset = _paginate(items)
-    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh}
+    meta = _mailbox_service.local_metadata()
+    meta["refreshed"] = refresh
+    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh,"source":meta["source"],"index_updated_at":meta.get("index_updated_at"),"local_alias_count":meta.get("local_alias_count",0),"index_alias_count":meta.get("index_alias_count",0)}
 
 @app.route("/api/v1/mailboxes")
 @_require_api_key
@@ -783,7 +933,66 @@ def api_accounts():
         ac["has_cookies"] = bool(a.get("cookies"))
         safe.append(ac)
     groups = _groups_with_mailbox_counts()
-    return jsonify({"accounts":safe,"count":len(safe),"groups":groups})
+    imap_configs = _list_imap_configs_safe()
+    return jsonify({"accounts":safe,"count":len(safe),"groups":groups,"imap_configs":imap_configs})
+@app.route("/api/imap-configs")
+def api_imap_configs():
+    configs = _list_imap_configs_safe()
+    return jsonify({"ok":True,"configs":configs,"count":len(configs)})
+
+@app.route("/api/imap-configs", methods=["POST"])
+def api_add_imap_config():
+    data = request.get_json() or {}
+    try:
+        config = _account_mgr.add_imap_config(
+            data.get("name", ""),
+            data.get("email") or data.get("mail_email") or "",
+            data.get("password") or data.get("mail_password") or "",
+            data.get("host") or data.get("mail_host") or "",
+            data.get("port") or data.get("mail_port") or 993,
+        )
+        return jsonify({"ok":True,"config":config})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/imap-configs/<config_id>", methods=["PUT"])
+def api_update_imap_config(config_id):
+    data = request.get_json() or {}
+    try:
+        config = _account_mgr.update_imap_config(
+            config_id,
+            data.get("name", ""),
+            data.get("email") or data.get("mail_email") or "",
+            data.get("password") or data.get("mail_password") or "",
+            data.get("host") or data.get("mail_host") or "",
+            data.get("port") or data.get("mail_port") or 993,
+        )
+        return jsonify({"ok":True,"config":config})
+    except KeyError as e:
+        return jsonify({"ok":False,"error":str(e).strip("'")}), 404
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/imap-configs/<config_id>", methods=["DELETE"])
+def api_delete_imap_config(config_id):
+    try:
+        return jsonify({"ok":_account_mgr.delete_imap_config(config_id)})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/imap-configs/<config_id>/test", methods=["GET", "POST"])
+def api_test_imap_config(config_id):
+    try:
+        result = _account_mgr.test_imap_config(config_id)
+        payload = {"ok":bool(result.get("ok")),"mail":result}
+        if not payload["ok"]:
+            payload["error"] = result.get("error") or "邮件读取暂不可用"
+        return jsonify(payload)
+    except KeyError as e:
+        return jsonify({"ok":False,"error":str(e).strip("'")}), 404
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
 
 @app.route("/api/groups")
 def api_groups():
@@ -851,10 +1060,13 @@ def api_add_account():
             name,
             cookie_input,
             data.get("host", "icloud.com"),
+            validate=False,
         )
-        _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
+        queued = _queue_account_validation(account["id"], "ui-add")
+        account = _account_mgr.get_account(account["id"]) or account
+        _emit_log("info",f"添加账号: {account.get('name','')}，后台校验已排队")
         safe = _safe_account(account)
-        return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status",""),"account":safe})
+        return jsonify({"ok":True,"queued":queued,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status",""),"account":safe})
     except ValueError as e: return jsonify({"ok":False,"error":str(e)})
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
@@ -877,9 +1089,12 @@ def api_update_account_session(acc_id):
             data.get("name", "未命名账号"),
             cookie_input,
             data.get("host", "icloud.com"),
+            validate=False,
         )
-        _emit_log("info", f"更新账号会话: {account.get('name','')} ({account.get('real_email','?')})")
-        return jsonify({"ok":True,"account":_safe_account(account)})
+        queued = _queue_account_validation(account["id"], "ui-session")
+        account = _account_mgr.get_account(account["id"]) or account
+        _emit_log("info", f"更新账号会话: {account.get('name','')}，后台校验已排队")
+        return jsonify({"ok":True,"queued":queued,"account":_safe_account(account)})
     except KeyError as e:
         return jsonify({"ok":False,"error":str(e).strip("'")}), 404
     except ValueError as e:
@@ -895,23 +1110,25 @@ def api_remove_account(acc_id):
 @app.route("/api/accounts/<acc_id>/validate", methods=["POST"])
 def api_validate_account(acc_id):
     try:
-        account = _account_mgr.validate_account(acc_id)
-        return jsonify({"ok":True,"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0)})
+        queued = _queue_account_validation(acc_id, "ui-validate")
+        account = _account_mgr.get_account(acc_id) or {}
+        return jsonify({"ok":True,"queued":queued,"account":_safe_account(account),"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0)})
     except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/accounts/<acc_id>/mail-settings", methods=["POST"])
 def api_set_mail_settings(acc_id):
     data = request.get_json() or {}
     try:
-        account = _account_mgr.set_mail_settings(
-            acc_id,
-            data.get("email") or data.get("mail_email") or "",
-            data.get("password") or data.get("mail_password") or "",
-            data.get("host") or data.get("mail_host") or "",
-            data.get("port") or data.get("mail_port") or 993,
-        )
+        account = _set_mail_settings_for_account(acc_id, data)
         result = _account_mgr.test_mail_connection(acc_id)
-        return jsonify({"ok":bool(result.get("ok")),"account":_safe_account(account),"mail":result})
+        return _mail_settings_response(account, result)
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/accounts/<acc_id>/mail-settings/test", methods=["GET", "POST"])
+def api_test_mail_settings(acc_id):
+    try:
+        return _mail_test_response(acc_id)
     except Exception as e:
         return jsonify({"ok":False,"error":str(e)})
 
@@ -1008,8 +1225,9 @@ def api_message_body(acc_id, msg_id):
 def api_specific_alias_mail(acc_id, alias_email):
     limit = request.args.get("limit",20,type=int)
     days = request.args.get("days",30,type=int)
+    force = request.args.get("force","0")=="1"
     try:
-        msgs = _account_mgr.check_alias_mail(acc_id, alias_email, limit=limit, days=days)
+        msgs = _account_mgr.check_alias_mail(acc_id, alias_email, limit=limit, days=days, force=force)
         return jsonify({"emails":msgs,"count":len(msgs),"alias":alias_email})
     except Exception as e: return jsonify({"emails":[],"count":0,"error":str(e)})
 
@@ -1093,6 +1311,14 @@ def api_scheduler_start():
 def api_scheduler_stop():
     _stop_event.set()
     return jsonify({"ok":True})
+
+@app.route("/api/logs")
+def api_logs():
+    limit = request.args.get("limit", 200, type=int)
+    since = request.args.get("since", 0, type=int)
+    entries = _log_entries(limit=limit, since=since)
+    return jsonify({"ok":True,"logs":entries,"count":len(entries),"last_seq":entries[-1]["seq"] if entries else since})
+
 
 @app.route("/api/log-stream")
 def api_log_stream():

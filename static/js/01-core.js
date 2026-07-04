@@ -2,6 +2,7 @@
   const S = window.HME = {
     accounts: [],
     groups: [],
+    imapConfigs: [],
     state: {},
     mailboxes: [],
     logs: [],
@@ -50,6 +51,7 @@
     S.state = state;
     S.accounts = accounts.accounts || [];
     S.groups = accounts.groups || [];
+    S.imapConfigs = accounts.imap_configs || [];
     renderSidebar();
   }
 
@@ -77,6 +79,7 @@
     if (S.route.startsWith('#/mailboxes')) return HME.renderMailboxes();
     if (S.route.startsWith('#/shared')) return HME.renderShared();
     if (S.route.startsWith('#/groups')) return HME.renderGroups();
+    if (S.route.startsWith('#/imap-configs')) return HME.renderImapConfigs();
     if (S.route.startsWith('#/batch')) return HME.renderBatch();
     if (S.route.startsWith('#/inbox')) return HME.renderInbox();
     if (S.route.startsWith('#/docs')) return HME.renderDocs();

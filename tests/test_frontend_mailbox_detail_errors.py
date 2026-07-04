@@ -45,3 +45,54 @@ vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context
 '''
     result = subprocess.run(["node", "-e", script], cwd=ROOT, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+def test_mailbox_detail_renders_local_metadata_before_message_fetch_resolves():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+let resolveMessages;
+const apiCalls = [];
+const S = {
+  accounts: [],
+  mailboxes: [],
+  groups: [],
+  E(){ return {textContent: ''}; },
+  esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); },
+  inlineArg(value){ return this.esc(JSON.stringify(value)); },
+  setTitle(){},
+  loading(){ return '<div class="loading">loading</div>'; },
+  empty(text){ return '<div class="empty">' + this.esc(text) + '</div>'; },
+  error(err){ return '<div class="error-box">' + this.esc(err.message || err) + '</div>'; },
+  view(html){ rendered = html; },
+  navigate(){},
+  toast(){},
+  debounce(){},
+  async api(path){
+    apiCalls.push(path);
+    if (path === '/api/mailboxes/alias%40icloud.com') {
+      return {ok:true, mailbox:{alias_email:'alias@icloud.com', account_id:'acc_1', account_name:'Main', label:'Login', is_active:true, shared:null}};
+    }
+    if (path === '/api/mailboxes/alias%40icloud.com/messages?limit=1') {
+      return new Promise(resolve => { resolveMessages = resolve; });
+    }
+    throw new Error('unexpected api ' + path);
+  }
+};
+const context = {window: {HME: S}, location: {hash:'#/mailbox/alias%40icloud.com'}, URLSearchParams, encodeURIComponent, navigator: {clipboard: {writeText(){}}}, console};
+vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context);
+(async () => {
+  const detailPromise = S.renderMailboxDetail('alias@icloud.com');
+  await Promise.resolve();
+  await Promise.resolve();
+  if (!apiCalls.includes('/api/mailboxes/alias%40icloud.com')) throw new Error('metadata was not requested first');
+  if (!rendered.includes('alias@icloud.com') || !rendered.includes('最新邮件')) {
+    throw new Error('local mailbox shell waited for message fetch: ' + rendered);
+  }
+  resolveMessages({ok:true, messages:[{message_id:'m1', subject:'Hello', from:'a@example.com', to:'alias@icloud.com', date:'today', body_preview:'preview'}]});
+  await detailPromise;
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    result = subprocess.run(["node", "-e", script], cwd=ROOT, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr

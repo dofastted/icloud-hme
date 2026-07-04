@@ -96,6 +96,18 @@ def test_mailbox_service_lists_local_cache_without_remote_wait(tmp_path):
     assert next(i for i in all_items if i["alias_email"] == "alias@icloud.com")["shared"]["prefix"]
 
 
+
+def test_mailbox_service_marks_refresh_zero_results_as_local_source(tmp_path):
+    manager = FakeManager()
+    latest = latest_file(tmp_path)
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "mailbox_index.json")
+
+    items = svc.list_mailboxes(refresh=False)
+
+    assert manager.alias_calls == 0
+    assert items
+    assert {item["source"] for item in items} == {"local"}
+
 def test_mailbox_refresh_persists_remote_index(tmp_path):
     manager = FakeManager()
     index = tmp_path / "mailbox_index.json"

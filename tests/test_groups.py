@@ -2,9 +2,10 @@ import json
 import sys
 import types
 
+import pytest
 import account_manager
 import web_ui
-from account_manager import AccountManager, DEFAULT_GROUP_COLOR, DEFAULT_GROUP_ID
+from account_manager import AccountManager, BUILTIN_GROUP_IDS, DEFAULT_GROUP_COLOR, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID
 from mailbox_service import MailboxService
 from shared_mailboxes import SharedMailboxStore
 
@@ -31,7 +32,7 @@ class MailboxGroupFakeManager:
     def __init__(self):
         self._cache = None
         self.groups = {
-            "grp_default": {"id": "grp_default", "name": "默认分组", "color": "#1f8b4c"},
+            "grp_default": {"id": "grp_default", "name": "可用", "color": "#1f8b4c"},
             "grp_work": {"id": "grp_work", "name": "Work", "color": "#123456"},
             "grp_personal": {"id": "grp_personal", "name": "Personal", "color": "#654321"},
         }
@@ -72,6 +73,7 @@ def default_group(manager):
     groups = manager.list_groups()
     matches = [group for group in groups if group.get("is_default") is True]
     assert len(matches) == 1, groups
+    assert matches[0]["name"] == "可用"
     return matches[0]
 
 
@@ -124,7 +126,9 @@ def test_legacy_accounts_file_gets_default_group_and_mailbox_mapping(monkeypatch
     saved = json.loads(accounts_path.read_text(encoding="utf-8"))
     assert "group_id" not in saved["accounts"]["acc_legacy"]
     assert saved["mailbox_groups"] == {"vip@icloud.com": "grp_vip"}
-    assert any(group.get("is_default") is True for group in saved["groups"].values())
+    groups = manager.list_groups()
+    assert [group["name"] for group in groups[:3]] == ["可用", "不可用", "废弃"]
+    assert all(group.get("is_system") is True for group in groups[:3])
 
 
 def test_account_manager_group_lifecycle_reorder_mailbox_move_and_delete(monkeypatch, tmp_path):
@@ -155,8 +159,14 @@ def test_account_manager_group_lifecycle_reorder_mailbox_move_and_delete(monkeyp
     assert manager.get_group(vip["id"])["mailbox_count"] == 2
 
     manager.reorder_groups([cold["id"], vip["id"]])
-    ordered_custom_ids = [gid for gid in group_ids(manager) if gid != default["id"]]
+    ordered_custom_ids = [gid for gid in group_ids(manager) if gid not in BUILTIN_GROUP_IDS]
     assert ordered_custom_ids[:2] == [cold["id"], vip["id"]]
+
+    with pytest.raises(ValueError, match="内置状态分组不能删除"):
+        manager.delete_group(UNAVAILABLE_GROUP_ID)
+
+    with pytest.raises(ValueError, match="内置状态分组不能编辑"):
+        manager.update_group(UNAVAILABLE_GROUP_ID, name="Other")
 
     assert manager.delete_group(vip["id"]) is True
     assert manager.get_mailbox_group("one@icloud.com")["id"] == default["id"]

@@ -30,6 +30,10 @@ from typing import Optional, Dict, List
 IMAP_SERVER = "imap.mail.me.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 20
+IMAP_CLIENT_ID = '("name" "iCloud HME" "version" "1.0")'
+JUNK_NAME_HINTS = ("junk", "spam", "bulk", "垃圾")
+
+
 CODE_PATTERNS = [
     re.compile(r"(?<!\d)(\d{4,8})(?!\d)"),
     re.compile(r"(?<![A-Za-z0-9])([A-Z0-9]{4,8})(?![A-Za-z0-9])", re.IGNORECASE),
@@ -52,6 +56,7 @@ class ICloudMail:
         try:
             self._conn = imaplib.IMAP4_SSL(self.server, self.port, timeout=IMAP_TIMEOUT)
             self._conn.login(self.apple_id, self.app_password)
+            self._send_client_id()
             if self.verbose:
                 print(f"[IMAP] Connected as {self.apple_id} via {self.server}:{self.port}")
             return True
@@ -62,6 +67,19 @@ class ICloudMail:
             raise RuntimeError("邮件服务器连接失败，请检查 IMAP 服务器和端口")
         except Exception as e:
             raise RuntimeError("邮件服务器连接失败，请检查 IMAP 服务器和端口") from e
+
+    def _send_client_id(self):
+        if not self._conn:
+            return
+        capabilities = getattr(self._conn, "capabilities", ()) or ()
+        has_id = any((cap.decode() if isinstance(cap, bytes) else str(cap)).upper() == "ID" for cap in capabilities)
+        if not has_id:
+            return
+        imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
+        try:
+            self._conn._simple_command("ID", IMAP_CLIENT_ID)
+        except Exception:
+            pass
 
     def disconnect(self):
         if self._conn:
@@ -79,22 +97,80 @@ class ICloudMail:
         if not self._conn:
             self.connect()
         if self._conn.state != "SELECTED":
-            self._conn.select("INBOX", readonly=True)
+            self._select_mailbox("INBOX")
 
-    def check_inbox(self, limit: int = 50, days: int = 7) -> List[Dict]:
-        self._ensure_connected()
-        return self._search_and_fetch(None, limit, days)
-
-    def check_unread(self, limit: int = 50, days: int = 7) -> List[Dict]:
-        self._ensure_connected()
-        return self._search_and_fetch("UNSEEN", limit, days)
-
-    def find_by_recipient(self, recipient: str, limit: int = 20, days: int = 30) -> List[Dict]:
-        self._ensure_connected()
+    def _select_mailbox(self, mailbox: str = "INBOX") -> int:
+        if not self._conn:
+            self.connect()
+        status, data = self._conn.select(mailbox or "INBOX", readonly=True)
+        if status != "OK":
+            raise RuntimeError(self._imap_error(f"无法选中 {mailbox or 'INBOX'}", data))
         try:
-            return self._search_and_fetch(f'TO "{recipient}"', limit, days)
+            return int(data[0]) if data else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _mailboxes_to_search(self, include_junk: bool = True) -> List[str]:
+        mailboxes = ["INBOX"]
+        if include_junk:
+            for mailbox in self._junk_mailboxes():
+                if mailbox and mailbox not in mailboxes:
+                    mailboxes.append(mailbox)
+        return mailboxes
+
+    def _junk_mailboxes(self) -> List[str]:
+        if not self._conn:
+            self.connect()
+        status, data = self._conn.list()
+        if status != "OK":
+            return []
+        result: List[str] = []
+        for raw in data or []:
+            text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+            mailbox = self._parse_list_mailbox(text)
+            flags = text.split(")", 1)[0].lower()
+            lowered = mailbox.lower()
+            if "\\junk" in flags or any(hint in lowered for hint in JUNK_NAME_HINTS):
+                result.append(mailbox)
+        return result
+
+    @staticmethod
+    def _parse_list_mailbox(text: str) -> str:
+        match = re.search(r'\)\s+"[^"]*"\s+(.+)$', text or "")
+        if not match:
+            return ""
+        name = match.group(1).strip()
+        if name.startswith('"') and name.endswith('"'):
+            return name[1:-1].replace('\\"', '"')
+        return name
+
+    @staticmethod
+    def _imap_error(prefix: str, data) -> str:
+        if not data:
+            return prefix
+        parts = []
+        for item in data:
+            parts.append(item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item))
+        detail = "; ".join(part for part in parts if part)
+        return f"{prefix}: {detail}" if detail else prefix
+
+    def check_inbox(self, limit: int = 50, days: int = 7, include_junk: bool = True) -> List[Dict]:
+        if not self._conn:
+            self.connect()
+        return self._search_mailboxes(None, limit, days, include_junk)
+
+    def check_unread(self, limit: int = 50, days: int = 7, include_junk: bool = True) -> List[Dict]:
+        if not self._conn:
+            self.connect()
+        return self._search_mailboxes("UNSEEN", limit, days, include_junk)
+
+    def find_by_recipient(self, recipient: str, limit: int = 20, days: int = 30, include_junk: bool = True) -> List[Dict]:
+        if not self._conn:
+            self.connect()
+        try:
+            return self._search_mailboxes(f'TO "{recipient}"', limit, days, include_junk)
         except Exception:
-            all_msgs = self._search_and_fetch(None, limit * 3, days)
+            all_msgs = self._search_mailboxes(None, limit * 3, days, include_junk)
             return [m for m in all_msgs if recipient.lower() in m.get("to", "").lower()][:limit]
 
     def find_verification_codes(self, recipient: str = "",
@@ -141,24 +217,45 @@ class ICloudMail:
                     return code
         return ""
 
-    def stream_inbox(self, limit: int = 50, days: int = 7):
-        self._ensure_connected()
-        since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-        full = f'(SINCE "{since}")'
-        status, data = self._conn.uid("SEARCH", None, full)
-        if status != "OK" or not data[0]:
-            return
-        uids = data[0].split()
-        recent = uids[-limit:] if len(uids) > limit else uids
-        for uid in reversed(recent):
+    def stream_inbox(self, limit: int = 50, days: int = 7, include_junk: bool = True):
+        if not self._conn:
+            self.connect()
+        for mailbox in self._mailboxes_to_search(include_junk):
+            since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+            full = f'(SINCE "{since}")'
             try:
-                msg = self._fetch_headers_uid(uid)
-                if msg:
-                    yield msg
+                self._select_mailbox(mailbox)
+                status, data = self._conn.uid("SEARCH", None, full)
             except Exception:
                 continue
+            if status != "OK" or not data[0]:
+                continue
+            uids = data[0].split()
+            recent = uids[-limit:] if len(uids) > limit else uids
+            for uid in reversed(recent):
+                try:
+                    msg = self._fetch_headers_uid(uid, mailbox)
+                    if msg:
+                        yield msg
+                except Exception:
+                    continue
 
-    def _search_and_fetch(self, criteria: Optional[str], limit: int, days: int) -> List[Dict]:
+    def _search_mailboxes(self, criteria: Optional[str], limit: int, days: int,
+                          include_junk: bool = True) -> List[Dict]:
+        emails: List[Dict] = []
+        for mailbox in self._mailboxes_to_search(include_junk):
+            try:
+                emails.extend(self._search_and_fetch(criteria, limit, days, mailbox))
+            except Exception:
+                if mailbox == "INBOX":
+                    raise
+                continue
+        emails.sort(key=lambda item: str(item.get("date") or ""), reverse=True)
+        return emails[:limit]
+
+    def _search_and_fetch(self, criteria: Optional[str], limit: int, days: int,
+                          mailbox: str = "INBOX") -> List[Dict]:
+        self._select_mailbox(mailbox)
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
         full = f'({criteria} SINCE "{since}")' if criteria else f'(SINCE "{since}")'
         status, data = self._conn.uid("SEARCH", None, full)
@@ -169,7 +266,7 @@ class ICloudMail:
         emails: List[Dict] = []
         for uid in reversed(recent):
             try:
-                msg = self._fetch_headers_uid(uid)
+                msg = self._fetch_headers_uid(uid, mailbox)
                 if msg:
                     emails.append(msg)
             except Exception:
@@ -182,13 +279,13 @@ class ICloudMail:
             return None
         return self._parse_header_response(data, msg_id)
 
-    def _fetch_headers_uid(self, uid: bytes) -> Optional[Dict]:
+    def _fetch_headers_uid(self, uid: bytes, mailbox: str = "INBOX") -> Optional[Dict]:
         status, data = self._conn.uid("FETCH", uid, "(BODY.PEEK[HEADER])")
         if status != "OK":
             return None
-        return self._parse_header_response(data, uid)
+        return self._parse_header_response(data, uid, mailbox)
 
-    def _parse_header_response(self, data, msg_id: bytes) -> Optional[Dict]:
+    def _parse_header_response(self, data, msg_id: bytes, mailbox: str = "INBOX") -> Optional[Dict]:
         raw = self._extract_body(data)
         if not raw:
             return None
@@ -197,7 +294,8 @@ class ICloudMail:
         except Exception:
             return None
         return {
-            "id": msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
+            "id": self._format_message_id(mailbox, msg_id),
+            "mailbox": mailbox,
             "from": self._decode_header(msg.get("From", "")),
             "to": self._decode_header(msg.get("To", "")),
             "subject": self._decode_header(msg.get("Subject", "")),
@@ -206,9 +304,26 @@ class ICloudMail:
             "size": len(raw),
         }
 
+    @staticmethod
+    def _format_message_id(mailbox: str, uid: bytes) -> str:
+        uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+        if (mailbox or "INBOX").upper() == "INBOX":
+            return uid_text
+        return f"{mailbox}:{uid_text}"
+
+    @staticmethod
+    def _split_message_id(msg_id: bytes) -> tuple[str, bytes]:
+        text = msg_id.decode("utf-8", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
+        if ":" in text:
+            mailbox, uid = text.rsplit(":", 1)
+            if mailbox and uid:
+                return mailbox, uid.encode("utf-8")
+        return "INBOX", text.encode("utf-8")
+
     def fetch_body(self, msg_id: bytes) -> Optional[str]:
-        self._ensure_connected()
-        status, data = self._conn.uid("FETCH", msg_id, "(BODY.PEEK[TEXT])")
+        mailbox, uid = self._split_message_id(msg_id)
+        self._select_mailbox(mailbox)
+        status, data = self._conn.uid("FETCH", uid, "(BODY.PEEK[TEXT])")
         if status != "OK":
             return None
         raw = self._extract_body(data)
@@ -220,11 +335,12 @@ class ICloudMail:
             return raw.decode("latin-1", errors="replace")
 
     def fetch_full(self, msg_id: bytes) -> Optional[Dict]:
-        self._ensure_connected()
-        msg = self._fetch_full_message(msg_id)
+        mailbox, uid = self._split_message_id(msg_id)
+        self._select_mailbox(mailbox)
+        msg = self._fetch_full_message(uid)
         if not msg:
             return None
-        hdr = self._fetch_headers_uid(msg_id)
+        hdr = self._fetch_headers_uid(uid, mailbox)
         if hdr:
             msg.update(hdr)
         return msg
@@ -324,14 +440,15 @@ class ICloudMail:
     def test_connection(self) -> Dict:
         try:
             self.connect()
-            status, data = self._conn.select("INBOX", readonly=True)
-            if status != "OK":
-                return {"ok": False, "error": "无法选中 INBOX"}
-            msg_count = int(data[0]) if data else 0
-            self.disconnect()
+            msg_count = self._select_mailbox("INBOX")
             return {"ok": True, "email": self.apple_id, "server": self.server, "port": self.port, "inbox_count": msg_count}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
+        finally:
+            try:
+                self.disconnect()
+            except Exception:
+                pass
 
     @staticmethod
     def _safe_date(date_str: str) -> str:
