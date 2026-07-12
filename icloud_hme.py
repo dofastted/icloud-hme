@@ -215,6 +215,31 @@ def _decrypt_chrome_value(encrypted_value: bytes, key: bytes) -> Optional[str]:
     return None
 
 
+
+# ============================================================
+# 区域 host 规范化
+# ============================================================
+
+def normalize_icloud_host(host: str = "") -> str:
+    """Map region aliases to icloud.com / icloud.com.cn.
+
+    Accepts icloud.com(.cn), apple.com(.cn) and common www/subdomain forms.
+    """
+    h = str(host or "icloud.com").strip().lower()
+    try:
+        h = urlparse(h if "://" in h else f"https://{h}").hostname or h
+    except Exception:
+        pass
+    h = h.lstrip(".")
+    if (
+        h == "icloud.com.cn"
+        or h.endswith(".icloud.com.cn")
+        or h == "apple.com.cn"
+        or h.endswith(".apple.com.cn")
+    ):
+        return "icloud.com.cn"
+    return "icloud.com"
+
 # ============================================================
 # iCloud HME API 客户端
 # ============================================================
@@ -237,12 +262,7 @@ class ICloudHME:
 
     @staticmethod
     def _normalize_host(host: str) -> str:
-        h = host.strip().lower()
-        try:
-            h = urlparse(h if "://" in h else f"https://{h}").hostname or h
-        except Exception:
-            pass
-        return "icloud.com.cn" if (h.endswith(".icloud.com.cn") or h == "icloud.com.cn") else "icloud.com"
+        return normalize_icloud_host(host)
 
     @staticmethod
     def _generate_client_id() -> str:
@@ -774,7 +794,8 @@ def main():
 def _add_common_args(parser):
     parser.add_argument("--cookies", type=str, help="手动指定 cookies.json 路径")
     parser.add_argument("--host", type=str, default="icloud.com",
-                       choices=["icloud.com", "icloud.com.cn"], help="iCloud 区域")
+                       choices=["icloud.com", "icloud.com.cn", "apple.com", "apple.com.cn"],
+                       help="iCloud 区域（apple.com / apple.com.cn 会映射到对应 icloud 域）")
     parser.add_argument("--quiet", "-q", action="store_true", help="减少输出")
 
 

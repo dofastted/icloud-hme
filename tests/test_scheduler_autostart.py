@@ -11,6 +11,29 @@ import web_ui
 from account_manager import SCHEDULER_ALIAS_LIMIT, account_reached_scheduler_limit, scheduler_eligible_accounts
 
 
+ROOT = Path(__file__).resolve().parents[1]
+AUTOSTART_SCRIPT = ROOT / "scripts/install-autostart-service.sh"
+
+
+def run_autostart_script(extra_env):
+    env = dict(os.environ)
+    env.update({
+        "PYTHON_BIN": "/usr/bin/python3",
+        "SERVICE_USER": "tester",
+        "SERVICE_GROUP": "tester",
+        "SERVICE_NAME": "icloud-hme-test.service",
+    })
+    env.update(extra_env)
+    return subprocess.run(
+        ["sh", str(AUTOSTART_SCRIPT)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
 class FakeManager:
     def __init__(self, accounts, refreshed_counts=None):
         self.accounts = {account["id"]: dict(account) for account in accounts}
@@ -208,24 +231,12 @@ def test_web_ui_start_scheduler_is_idempotent(monkeypatch):
 
 
 def test_autostart_service_unit_starts_scheduler():
-    root = Path(__file__).resolve().parents[1]
-    env = dict(os.environ)
-    env.update({
+    result = run_autostart_script({
         "DRY_RUN": "1",
-        "PYTHON_BIN": "/usr/bin/python3",
         "HOST": "127.0.0.1",
         "PORT": "6060",
-        "SERVICE_NAME": "icloud-hme-test.service",
+        "AUTOSTART_MODE": "systemd",
     })
-
-    result = subprocess.run(
-        ["sh", "scripts/install-autostart-service.sh"],
-        cwd=root,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
 
     assert result.returncode == 0, result.stderr
     unit = result.stdout
@@ -236,8 +247,107 @@ def test_autostart_service_unit_starts_scheduler():
     assert "web_ui.py --scheduler --no-sync" in unit
 
 
-def test_autostart_install_restarts_existing_service():
-    script = Path("scripts/install-autostart-service.sh").read_text(encoding="utf-8")
+def test_autostart_wsl_systemd_offline_prints_windows_login_scheduler_command(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log_path = tmp_path / "commands.log"
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf 'systemctl %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "if [ \"$1\" = \"is-system-running\" ]; then\n"
+        "  echo offline\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        "#!/bin/sh\n"
+        "printf 'sudo %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    sudo.chmod(0o755)
+    schtasks = bin_dir / "schtasks.exe"
+    schtasks.write_text(
+        "#!/bin/sh\n"
+        "printf 'schtasks %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    schtasks.chmod(0o755)
 
-    assert 'systemctl enable "$SERVICE_NAME"' in script
-    assert 'systemctl restart "$SERVICE_NAME"' in script
+    result = run_autostart_script({
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "LOG_PATH": str(log_path),
+        "WSL_DISTRO_NAME": "Ubuntu",
+        "WSL_INTEROP": "/run/WSL/1_interop",
+    })
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "systemd" in output
+    assert "Windows" in output or "schtasks" in output or "Startup" in output
+    assert "C:\\Windows\\System32\\wsl.exe" in output
+    assert "-d Ubuntu --exec /bin/sh" in output
+    assert "--scheduler" in output or "AUTO_START_SCHEDULER=1" in output
+    assert "--no-sync" in output
+    commands = log_path.read_text(encoding="utf-8")
+    assert "systemctl is-system-running" in commands
+    assert "sudo " not in commands
+    assert "schtasks /Create /F" in commands
+    assert "C:\\Windows\\System32\\wsl.exe -d Ubuntu --exec /bin/sh" in commands
+    assert '"Ubuntu"' not in commands
+    assert "run-autostart-service.sh" in commands
+    assert "schtasks /Run" in commands
+
+
+def test_autostart_install_uses_fake_systemd_without_touching_host(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log_path = tmp_path / "commands.log"
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf 'systemctl %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "if [ \"$1\" = \"is-system-running\" ]; then\n"
+        "  echo running\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    install = bin_dir / "install"
+    install.write_text(
+        "#!/bin/sh\n"
+        "printf 'install %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    install.chmod(0o755)
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        "#!/bin/sh\n"
+        "printf 'sudo %s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "\"$@\"\n",
+        encoding="utf-8",
+    )
+    sudo.chmod(0o755)
+
+    result = run_autostart_script({
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "LOG_PATH": str(log_path),
+    })
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    commands = log_path.read_text(encoding="utf-8")
+    assert "systemctl is-system-running" in commands
+    assert "sudo install -m 0644" in commands
+    assert "/etc/systemd/system/icloud-hme-test.service" in commands
+    assert "sudo systemctl daemon-reload" in commands
+    assert "sudo systemctl enable icloud-hme-test.service" in commands
+    assert "sudo systemctl restart icloud-hme-test.service" in commands
+    assert "sudo systemctl --no-pager --full status icloud-hme-test.service" in commands

@@ -113,6 +113,72 @@ def account_has_mail_config(account: Dict) -> bool:
     return bool(account_mail_email(account) and account_mail_host(account) and (account.get("mail_password") or account.get("app_password")))
 
 
+def normalize_account_host(host: Any = "") -> str:
+    """Map UI region aliases (apple.com / apple.com.cn) to icloud hosts."""
+    raw = str(host or "").strip() or "icloud.com"
+    try:
+        from icloud_hme import normalize_icloud_host
+
+        return normalize_icloud_host(raw)
+    except Exception:
+        # Tests often replace icloud_hme with a stub; keep a local fallback.
+        h = raw.lower()
+        if "apple.com.cn" in h or h.endswith("icloud.com.cn") or h == "icloud.com.cn":
+            return "icloud.com.cn"
+        return "icloud.com"
+
+
+def is_hard_session_error(error: Any) -> bool:
+    """True only for auth/session-invalid failures that should demote status.
+
+    Network blips, proxy cold-start, and Apple temporary 5xx must not flip a
+    previously active account to error after restart or health checks.
+    """
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    hard_markers = (
+        "http 401",
+        "http 403",
+        "http 421",
+        "accountloginui",
+        "authentication",
+        "not authenticated",
+        "invalid session",
+        "session expired",
+        "sign in",
+        "signin",
+        "login required",
+        "require login",
+        "hsa challenge",
+        "two-factor",
+        "2fa",
+        "cookie",
+        "无法解析 cookie",
+        "该会话属于已存在账号",
+    )
+    if any(marker in text for marker in hard_markers):
+        return True
+    soft_markers = (
+        "timeout",
+        "timed out",
+        "连接失败",
+        "connection",
+        "temporarily",
+        "proxy",
+        "name or service not known",
+        "temporary failure",
+        "network is unreachable",
+        "http 5",
+        "http 429",
+        "max retries",
+    )
+    if any(marker in text for marker in soft_markers):
+        return False
+    # Unknown errors: treat as soft for already-active accounts.
+    return False
+
+
 def coerce_mail_port(port: Any) -> int:
     try:
         value = int(port or 993)
@@ -657,6 +723,7 @@ class AccountManager:
     def _refresh_session_state(self, account: Dict) -> Dict:
         from icloud_hme import ICloudHME
 
+        previous_status = str(account.get("status") or "")
         try:
             client = ICloudHME(
                 account["cookies"],
@@ -686,9 +753,17 @@ class AccountManager:
             account["last_validated"] = datetime.now().isoformat()
             account["last_error"] = None
         except Exception as e:
-            account["status"] = "error"
-            account["validation_status"] = "error"
-            account["last_error"] = str(e)[:300]
+            err = str(e)[:300]
+            account["last_error"] = err
+            account["last_validated"] = datetime.now().isoformat()
+            hard = is_hard_session_error(err)
+            # Active accounts stay active on soft/transient failures (reboot proxy blip).
+            if previous_status == "active" and not hard:
+                account["status"] = "active"
+                account["validation_status"] = "degraded"
+            else:
+                account["status"] = "error"
+                account["validation_status"] = "error"
 
         return account
 
@@ -698,7 +773,7 @@ class AccountManager:
     ) -> Dict:
         cookies = self.parse_cookie_input(cookie_input)
         acc_id = self._generate_id()
-        clean_host = str(host or "icloud.com").strip() or "icloud.com"
+        clean_host = normalize_account_host(host)
 
         account: Dict[str, Any] = {
             "id": acc_id,
@@ -763,7 +838,7 @@ class AccountManager:
                 raise KeyError(f"账号不存在: {acc_id}")
             account = dict(current)
 
-        clean_host = str(host or account.get("host") or "icloud.com").strip() or "icloud.com"
+        clean_host = normalize_account_host(host or account.get("host") or "icloud.com")
         account.update({
             "name": str(name or account.get("name") or "未命名账号").strip() or "未命名账号",
             "cookies": cookies,
@@ -963,7 +1038,13 @@ class AccountManager:
 
         return primary or apple_id
 
-    def validate_account(self, acc_id: str, expected_session_version: Optional[int] = None) -> Dict:
+    def validate_account(
+        self,
+        acc_id: str,
+        expected_session_version: Optional[int] = None,
+        *,
+        reason: str = "manual",
+    ) -> Dict:
         with self._lock:
             account = self.accounts.get(acc_id)
             if not account:
@@ -973,6 +1054,10 @@ class AccountManager:
                 if current_version != int(expected_session_version):
                     return dict(account)
             working = dict(account)
+
+        reason_key = str(reason or "manual").strip().lower() or "manual"
+        # Health checks must not re-apply identity collision after account exists.
+        check_duplicate = reason_key not in {"health"}
 
         working["validation_status"] = "running"
         working["validation_started_at"] = datetime.now().isoformat()
@@ -986,12 +1071,17 @@ class AccountManager:
                 current_version = int(current.get("session_version") or 0)
                 if current_version != int(expected_session_version):
                     return dict(current)
-            duplicate = self._find_account_by_identity(working)
-            if duplicate and duplicate.get("id") != acc_id:
-                working["status"] = "error"
-                working["validation_status"] = "error"
-                label = duplicate.get("name") or duplicate.get("real_email") or duplicate.get("id")
-                working["last_error"] = f"该会话属于已存在账号: {label}"
+            if check_duplicate:
+                duplicate = self._find_account_by_identity(working)
+                if duplicate and duplicate.get("id") != acc_id:
+                    working["status"] = "error"
+                    working["validation_status"] = "error"
+                    label = (
+                        duplicate.get("name")
+                        or duplicate.get("real_email")
+                        or duplicate.get("id")
+                    )
+                    working["last_error"] = f"该会话属于已存在账号: {label}"
             self.accounts[acc_id] = working
             self._save()
             return dict(working)

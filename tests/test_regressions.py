@@ -138,6 +138,26 @@ def test_icloud_hme_account_info():
 
 
 
+def test_icloud_hme_normalize_host_accepts_apple_aliases():
+    """apple.com / apple.com.cn 映射到对应 icloud 区域"""
+    from icloud_hme import ICloudHME, normalize_icloud_host
+    from account_manager import normalize_account_host
+
+    assert normalize_icloud_host("apple.com") == "icloud.com"
+    assert normalize_icloud_host("www.apple.com") == "icloud.com"
+    assert normalize_icloud_host("apple.com.cn") == "icloud.com.cn"
+    assert normalize_icloud_host("www.apple.com.cn") == "icloud.com.cn"
+    assert normalize_icloud_host("icloud.com.cn") == "icloud.com.cn"
+    assert normalize_icloud_host("icloud.com") == "icloud.com"
+    assert ICloudHME._normalize_host("apple.com.cn") == "icloud.com.cn"
+    assert normalize_account_host("apple.com.cn") == "icloud.com.cn"
+    assert normalize_account_host("apple.com") == "icloud.com"
+    client = ICloudHME({"X-APPLE-WEBAUTH-USER": "1"}, host="apple.com.cn", verbose=False)
+    assert client.host == "icloud.com.cn"
+    assert client.setup_url.startswith("https://setup.icloud.com.cn/")
+    print("  PASS test_icloud_hme_normalize_host_accepts_apple_aliases")
+
+
 def test_icloud_hme_build_url_adds_required_query_params():
     """HME API URL 必须带 Apple Web 必需的查询参数"""
     from urllib.parse import parse_qs, urlparse

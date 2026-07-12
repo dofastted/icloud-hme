@@ -97,7 +97,7 @@ const vm = require('vm');
 const elements = {
   modalRoot: {innerHTML: ''},
   editAccountNameInput: {value: 'Renamed'},
-  editAccountHostInput: {value: 'icloud.com.cn'},
+  editAccountHostInput: {value: 'apple.com.cn'},
   editAccountSessionInput: {value: 'C=3'},
   editAccountSubmit: {disabled: false, textContent: '保存并校验'},
   modalMsg: {textContent: ''},
@@ -129,9 +129,12 @@ vm.runInNewContext(fs.readFileSync('static/js/02-accounts.js', 'utf8'), context)
   const html = elements.modalRoot.innerHTML;
   if (!html.includes('A=1; B=2')) throw new Error('session data missing from modal: ' + html);
   if (!html.includes('编辑账号 Session')) throw new Error('edit modal title missing: ' + html);
+  if (!html.includes('<select id="editAccountHostInput">')) throw new Error('region select missing: ' + html);
+  if (!html.includes('value="apple.com"') || !html.includes('value="apple.com.cn"')) throw new Error('region options missing: ' + html);
+  if (!html.includes('value="apple.com" selected')) throw new Error('global region should be selected for icloud.com: ' + html);
   await S.saveAccountSession('acc_1');
   if (!elements.editAccountSubmit.disabled) throw new Error('submit button was not disabled');
-  if (posted.name !== 'Renamed' || posted.host !== 'icloud.com.cn' || posted.cookie_input !== 'C=3') {
+  if (posted.name !== 'Renamed' || posted.host !== 'apple.com.cn' || posted.cookie_input !== 'C=3') {
     throw new Error('unexpected update payload ' + JSON.stringify(posted));
   }
   if (toast !== '账号已更新') throw new Error('success toast missing');

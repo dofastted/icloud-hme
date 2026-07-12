@@ -56,17 +56,24 @@ python web_ui.py --scheduler        # 启动 Web 后自动开启调度器
 scripts/install-autostart-service.sh
 ```
 
-脚本需要 systemd 正在运行；会安装并启用 `icloud-hme.service`，服务启动命令固定带 `--scheduler --no-sync`，并设置 `AUTO_START_SCHEDULER=1`。脚本会执行 `daemon-reload`、`enable` 和 `restart`，因此重新运行脚本会立即加载新的服务配置。系统重启或服务重启后，Web UI 和调度器会一起启动。
+脚本会自动选择可用后端：
+
+- native Linux 且 systemd 正在运行：安装并启用 `icloud-hme.service`，随后执行 `daemon-reload`、`enable` 和 `restart`。
+- WSL 且 systemd 未运行：安装 Windows 任务计划登录自启任务，任务通过 `wsl.exe` 调用 `scripts/run-autostart-service.sh` 拉起 Web UI。
+
+两种后端都会使用 `web_ui.py --scheduler --no-sync`，并设置 `AUTO_START_SCHEDULER=1`。systemd 后端会随系统服务启动；WSL 后端会在 Windows 用户登录后启动，不是未登录状态下的系统服务。
 
 可选覆盖：
 
 ```bash
 PORT=8080 HOST=0.0.0.0 SERVICE_NAME=icloud-hme.service scripts/install-autostart-service.sh
+AUTOSTART_MODE=systemd scripts/install-autostart-service.sh
+AUTOSTART_MODE=windows-task TASK_NAME="iCloud HME Web UI" scripts/install-autostart-service.sh
 ```
 
 调度规则：只调度活跃账号；单账号本地/刷新后的 `alias_total >= 750` 时跳过，不再创建新 HME。
 
-服务单元会使用项目目录的 `.venv/bin/python`（如存在），否则使用当前 `python`，并设置 `PYTHONPATH` 与 `RequiresMountsFor`，避免开机时项目目录或依赖未就绪导致服务启动失败。
+服务单元会使用项目目录的 `.venv/bin/python`（如存在），否则使用当前 `python`，并设置 `PYTHONPATH` 与 `RequiresMountsFor`，避免开机时项目目录或依赖未就绪导致服务启动失败。WSL 登录自启任务使用同一 Python 选择规则，并把输出写入 `logs/web_ui.autostart.log`。
 
 
 ### 命令行调度器

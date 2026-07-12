@@ -12,7 +12,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
 from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
 from shared_mailboxes import SharedMailboxStore
@@ -26,6 +26,8 @@ SCHEDULER_WINDOW_END_HOUR = 20
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+API_AVAILABLE_EXCLUDED_GROUP_IDS = {UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID}
 app = Flask(__name__)
 _log_queue = queue.Queue()
 _log_buffer = deque(maxlen=500)
@@ -378,6 +380,7 @@ def _validation_loop():
         job = _validation_queue.get()
         acc_id = job.get("account_id", "")
         version = int(job.get("version") or 0)
+        reason = str(job.get("reason") or "manual")
         try:
             account = _account_mgr.get_account(acc_id)
             if not account or int(account.get("session_version") or 0) != version:
@@ -387,13 +390,29 @@ def _validation_loop():
                 validation_status="running",
                 validation_started_at=_now().isoformat(),
             )
-            _emit_log("info", f"后台校验开始 [{account.get('name', acc_id)}]")
-            updated = _account_mgr.validate_account(acc_id, expected_session_version=version)
+            _emit_log("info", f"后台校验开始 [{account.get('name', acc_id)}] ({reason})")
+            updated = _account_mgr.validate_account(
+                acc_id,
+                expected_session_version=version,
+                reason=reason,
+            )
             label = updated.get("name") or acc_id
-            if updated.get("status") == "active":
+            status = updated.get("status")
+            validation_status = updated.get("validation_status")
+            if status == "active" and validation_status == "ok":
                 _emit_log("success", f"后台校验通过 [{label}]")
+            elif status == "active" and validation_status == "degraded":
+                _emit_log(
+                    "warn",
+                    f"后台校验暂时失败，保持可用 [{label}]: "
+                    f"{str(updated.get('last_error') or '')[:100]}",
+                )
             else:
-                _emit_log("warn", f"后台校验失败 [{label}]: {str(updated.get('last_error') or '')[:100]}")
+                _emit_log(
+                    "warn",
+                    f"后台校验失败 [{label}]: "
+                    f"{str(updated.get('last_error') or '')[:100]}",
+                )
         except Exception as exc:
             _emit_log("warn", f"后台校验异常 [{acc_id}]: {str(exc)[:100]}")
         finally:
@@ -515,16 +534,28 @@ def _scheduler_loop():
 
 def _health_loop():
     _error_reported = set()
+    # After reboot, proxy/network may not be ready; avoid immediate demotion storms.
+    first_delay_sec = int(os.environ.get("HME_HEALTH_FIRST_DELAY_SEC", "600"))
+    interval_sec = int(os.environ.get("HME_HEALTH_INTERVAL_SEC", "1800"))
+    if _stop_event.wait(max(60, first_delay_sec)):
+        return
     while not _stop_event.is_set():
-        if _stop_event.wait(300): break
         for account in _account_mgr.list_accounts():
-            if account.get("status") != "active": continue
+            if account.get("status") != "active":
+                continue
             try:
                 queued = _queue_account_validation(account["id"], "health")
                 if queued:
                     _error_reported.discard(account["id"])
             except Exception as e:
-                if account["id"] not in _error_reported: _emit_log("warn",f"健康检查排队失败 [{account.get('name','?')}]: {str(e)[:100]}"); _error_reported.add(account["id"])
+                if account["id"] not in _error_reported:
+                    _emit_log(
+                        "warn",
+                        f"健康检查排队失败 [{account.get('name', '?')}]: {str(e)[:100]}",
+                    )
+                    _error_reported.add(account["id"])
+        if _stop_event.wait(max(300, interval_sec)):
+            break
 
 # ----- Flask Routes -----
 
@@ -668,6 +699,7 @@ def _available_hme_item(item: dict, accounts: dict) -> dict:
         "shared": item.get("shared"),
     }
 
+
 def _available_hme_items(refresh: bool = False) -> list:
     account_id = request.args.get("account_id", "") if request else ""
     q = request.args.get("q", "") if request else ""
@@ -682,6 +714,8 @@ def _available_hme_items(refresh: bool = False) -> list:
     for item in items:
         account = accounts.get(item.get("account_id"), {})
         if account.get("status") != "active":
+            continue
+        if item.get("group_id") in API_AVAILABLE_EXCLUDED_GROUP_IDS:
             continue
         result.append(_available_hme_item(item, accounts))
     return result

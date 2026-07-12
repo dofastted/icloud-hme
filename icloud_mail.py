@@ -24,7 +24,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from typing import Optional, Dict, List
 
 IMAP_SERVER = "imap.mail.me.com"
@@ -33,6 +33,19 @@ IMAP_TIMEOUT = 20
 IMAP_CLIENT_ID = '("name" "iCloud HME" "version" "1.0")'
 JUNK_NAME_HINTS = ("junk", "spam", "bulk", "垃圾")
 
+RECIPIENT_HEADER_NAMES = (
+    "To",
+    "Cc",
+    "Delivered-To",
+    "X-Original-To",
+    "Original-To",
+    "Envelope-To",
+    "X-Envelope-To",
+    "Apparently-To",
+    "X-Apparently-To",
+    "Resent-To",
+    "X-Forwarded-To",
+)
 
 CODE_PATTERNS = [
     re.compile(r"(?<!\d)(\d{4,8})(?!\d)"),
@@ -167,11 +180,22 @@ class ICloudMail:
     def find_by_recipient(self, recipient: str, limit: int = 20, days: int = 30, include_junk: bool = True) -> List[Dict]:
         if not self._conn:
             self.connect()
+        recipient = str(recipient or "").strip().lower()
+        if not recipient:
+            return self.check_inbox(limit=limit, days=days, include_junk=include_junk)
+
         try:
-            return self._search_mailboxes(f'TO "{recipient}"', limit, days, include_junk)
+            messages = self._search_mailboxes(f'TO "{recipient}"', limit, days, include_junk)
         except Exception:
-            all_msgs = self._search_mailboxes(None, limit * 3, days, include_junk)
-            return [m for m in all_msgs if recipient.lower() in m.get("to", "").lower()][:limit]
+            messages = []
+
+        matched = self._filter_by_recipient(messages, recipient, limit)
+        if matched:
+            return matched
+
+        scan_limit = min(max(limit * 5, 50), 200)
+        all_msgs = self._search_mailboxes(None, scan_limit, days, include_junk)
+        return self._filter_by_recipient(all_msgs, recipient, limit)
 
     def find_verification_codes(self, recipient: str = "",
                                 limit: int = 10, days: int = 1) -> List[Dict]:
@@ -293,16 +317,52 @@ class ICloudMail:
             msg = email.message_from_bytes(raw + b"\r\n\r\n")
         except Exception:
             return None
+        recipients = self._recipient_header_text(msg)
         return {
             "id": self._format_message_id(mailbox, msg_id),
             "mailbox": mailbox,
             "from": self._decode_header(msg.get("From", "")),
-            "to": self._decode_header(msg.get("To", "")),
+            "to": self._decode_joined_headers(msg.get_all("To", [])),
+            "recipient_headers": recipients,
             "subject": self._decode_header(msg.get("Subject", "")),
             "date": self._safe_date(msg.get("Date", "")),
             "body_preview": "",
             "size": len(raw),
         }
+
+    def _filter_by_recipient(self, messages: List[Dict], recipient: str, limit: int) -> List[Dict]:
+        matched: List[Dict] = []
+        for message in messages:
+            if not self._message_matches_recipient(message, recipient):
+                continue
+            item = dict(message)
+            item["matched_recipient"] = recipient
+            matched.append(item)
+            if len(matched) >= limit:
+                break
+        return matched
+
+    @classmethod
+    def _message_matches_recipient(cls, message: Dict, recipient: str) -> bool:
+        recipient = str(recipient or "").strip().lower()
+        if not recipient:
+            return False
+        haystack = str(message.get("recipient_headers") or message.get("to") or "")
+        addresses = {addr.lower() for _name, addr in getaddresses([haystack]) if addr}
+        return recipient in addresses or recipient in haystack.lower()
+
+    @classmethod
+    def _recipient_header_text(cls, msg) -> str:
+        values = []
+        for name in RECIPIENT_HEADER_NAMES:
+            decoded = cls._decode_joined_headers(msg.get_all(name, []))
+            if decoded:
+                values.append(decoded)
+        return "\n".join(values)
+
+    @classmethod
+    def _decode_joined_headers(cls, values: List[str]) -> str:
+        return ", ".join(cls._decode_header(value) for value in values if value)
 
     @staticmethod
     def _format_message_id(mailbox: str, uid: bytes) -> str:

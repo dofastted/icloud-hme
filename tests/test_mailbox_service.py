@@ -41,6 +41,51 @@ class FakeMail:
         pass
 
 
+class HeaderMatchedMail(FakeMail):
+    def find_by_recipient(self, alias, limit=20, days=30):
+        return [
+            {
+                "id": "m3",
+                "subject": "Forwarded",
+                "from": "sender@example.com",
+                "to": "real@qq.com",
+                "recipient_headers": f"real@qq.com\nX-Original-To: {alias}",
+                "matched_recipient": alias,
+                "date": "2026-01-04",
+                "body_preview": "preview",
+            }
+        ][:limit]
+
+    def fetch_full(self, msg_id):
+        return {
+            "id": msg_id.decode(),
+            "subject": "Forwarded",
+            "from": "sender@example.com",
+            "to": "real@qq.com",
+            "recipient_headers": "real@qq.com\nX-Original-To: alias@icloud.com",
+            "date": "2026-01-04",
+            "body": "full forwarded body",
+        }
+
+
+
+class OpenAIVerificationMail(FakeMail):
+    def find_by_recipient(self, alias, limit=20, days=30):
+        return [
+            {"id": "otp", "subject": "Your temporary ChatGPT verification code", "from": "noreply@tm.openai.com", "to": alias, "date": "2026-01-05", "body_preview": ""},
+        ][:limit]
+
+    def fetch_full(self, msg_id):
+        return {
+            "id": msg_id.decode(),
+            "subject": "Your temporary ChatGPT verification code",
+            "from": "noreply@tm.openai.com",
+            "to": "alias@icloud.com",
+            "date": "2026-01-05",
+            "body": "Your ChatGPT verification code is 654321. This code expires shortly.",
+        }
+
+
 class AuthFailMail(FakeMail):
     def find_by_recipient(self, alias, limit=20, days=30):
         raise RuntimeError("邮件登录失败 — 请检查邮件认证凭据和账号状态")
@@ -133,11 +178,38 @@ def test_mailbox_service_latest_and_detail(tmp_path):
 
     latest = svc.get_latest_message("alias@icloud.com")
     assert latest["message_id"] == "m2"
-    assert latest["body_preview"] == "two"
+    assert latest["body_preview"] == "full body"
+    assert latest["body"] == "full body"
 
     detail = svc.get_message_detail("alias@icloud.com", "m2")
     assert detail["body"] == "full body"
 
+
+
+def test_latest_message_exposes_otp_from_full_body(tmp_path):
+    svc = MailboxService(FakeManager(mail=OpenAIVerificationMail()), latest_emails_path=latest_file(tmp_path), index_path=tmp_path / "idx_otp.json")
+
+    latest = svc.get_latest_message("alias@icloud.com", force=True)
+
+    assert latest["message_id"] == "otp"
+    assert latest["body"]
+    assert latest["otp_code"] == "654321"
+    assert latest["verification_code"] == "654321"
+    assert latest["code"] == "654321"
+
+
+def test_mailbox_service_detail_accepts_original_recipient_header(tmp_path):
+    svc = MailboxService(
+        FakeManager(mail=HeaderMatchedMail()),
+        latest_emails_path=latest_file(tmp_path),
+        index_path=tmp_path / "idx_forwarded.json",
+    )
+
+    latest = svc.get_latest_message("alias@icloud.com", force=True)
+    assert latest["message_id"] == "m3"
+
+    detail = svc.get_message_detail("alias@icloud.com", "m3")
+    assert detail["body"] == "full forwarded body"
 
 def test_mailbox_service_uses_cached_latest_order(tmp_path):
     manager = FakeManager(mail=FakeMail(fail=True))

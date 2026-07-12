@@ -169,6 +169,55 @@ def test_find_by_recipient_reads_junk_mailbox(monkeypatch):
     assert messages[0]["subject"] == "Junk hit"
 
 
+def test_find_by_recipient_falls_back_to_original_recipient_header(monkeypatch):
+    class ForwardedIMAP:
+        capabilities = (b"IMAP4rev1",)
+
+        def __init__(self, *_args, **_kwargs):
+            self.state = "AUTH"
+            self.mailbox = ""
+
+        def login(self, *_args):
+            return "OK", [b"logged in"]
+
+        def list(self):
+            return "OK", [b'() "/" "INBOX"']
+
+        def select(self, mailbox, readonly=False):
+            self.state = "SELECTED"
+            self.mailbox = mailbox
+            return "OK", [b"0"]
+
+        def uid(self, command, _charset, criteria):
+            if command == "SEARCH":
+                text = criteria.decode() if isinstance(criteria, bytes) else str(criteria)
+                if "TO" in text:
+                    return "OK", [b""]
+                return "OK", [b"42"]
+            if command == "FETCH":
+                header = (
+                    b"From: sender@example.com\r\n"
+                    b"To: real@qq.com\r\n"
+                    b"X-Original-To: Alias@iCloud.com\r\n"
+                    b"Subject: Forwarded hit\r\n"
+                    b"Date: Sat, 04 Jul 2026 12:00:00 +0000\r\n"
+                    + b"X-Pad: " + b"x" * 160 + b"\r\n"
+                )
+                return "OK", [(b"42 (BODY[HEADER] {240}", header)]
+            return "NO", []
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", ForwardedIMAP)
+
+    messages = ICloudMail("user@qq.com", "auth-code", server="imap.qq.com").find_by_recipient("alias@icloud.com")
+
+    assert len(messages) == 1
+    assert messages[0]["subject"] == "Forwarded hit"
+    assert messages[0]["matched_recipient"] == "alias@icloud.com"
+
+
 def test_account_mail_config_prefers_forwarding_mailbox():
     account = {"real_email": "user@qq.com", "mail_password": "secret"}
 

@@ -18,6 +18,7 @@ added to ``SharedPublicView``.
 """
 
 import json
+from email.utils import getaddresses
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -156,7 +157,10 @@ class MailboxService:
 
     def get_messages(self, alias_email: str, limit: int = 1, force: bool = False) -> List[Dict]:
         account, _meta = self.resolve_alias(alias_email)
-        return self._get_messages_for_account(account, alias_email, limit, force)
+        messages = self._get_messages_for_account(account, alias_email, limit, force)
+        if len(messages) == 1:
+            return [self._with_message_detail(account, alias_email, messages[0])]
+        return messages
 
     def get_latest_message(self, alias_email: str, force: bool = False) -> Optional[Dict]:
         messages = self.get_messages(alias_email, limit=1, force=force)
@@ -243,12 +247,26 @@ class MailboxService:
                 pass
         if not full:
             raise MailboxNotFound("message not found")
-        if _normalize_alias(alias_email) not in str(full.get("to", "")).lower():
+        alias = _normalize_alias(alias_email)
+        if not _message_matches_alias(full, alias):
             raise MailboxNotFound("message not found")
+        full.setdefault("matched_recipient", alias)
         detail = self._message_summary(full)
         detail["body"] = str(full.get("body") or "")
         detail["content_type"] = full.get("content_type", "")
         return detail
+
+    def _with_message_detail(self, account: Dict, alias_email: str, message: Dict) -> Dict:
+        msg_id = str(message.get("message_id") or "")
+        if not msg_id:
+            return message
+        try:
+            detail = self._get_message_detail_for_account(account, alias_email, msg_id)
+        except Exception:
+            return message
+        merged = dict(message)
+        merged.update({key: value for key, value in detail.items() if value not in (None, "")})
+        return merged
 
     def _mail_client(self, account_id: str):
         try:
@@ -357,6 +375,7 @@ class MailboxService:
             "account_id": source.get("account_id") or account.get("id", ""),
             "account_name": source.get("account_name") or account.get("name", ""),
             "label": source.get("label", ""),
+            "forward_to_email": source.get("forwardToEmail") or source.get("forward_to_email") or "",
             **group_fields,
             "is_active": bool(is_active),
             "created_at": source.get("createTimestamp") or source.get("createdAt") or source.get("created_at") or "",
@@ -397,17 +416,40 @@ class MailboxService:
 
     @staticmethod
     def _message_summary(message: Dict) -> Dict:
-        body = str(message.get("body") or message.get("body_preview") or "")
+        body = str(message.get("body") or "")
+        preview = str(message.get("body_preview") or body)
+        otp_code = _extract_message_otp(message)
         return {
             "message_id": str(message.get("message_id") or message.get("id") or ""),
             "subject": str(message.get("subject") or ""),
             "from": str(message.get("from") or ""),
             "to": str(message.get("to") or ""),
+            "matched_recipient": str(message.get("matched_recipient") or ""),
             "date": str(message.get("date") or ""),
-            "body_preview": body[:200],
-            "body": str(message.get("body") or ""),
+            "body_preview": preview[:500],
+            "body": body,
+            "text": body,
+            "otp_code": otp_code,
+            "verification_code": otp_code,
+            "code": otp_code,
         }
 
+
+
+def _extract_message_otp(message: Dict) -> str:
+    for key in ("otp_code", "verification_code", "code"):
+        value = str(message.get(key) or "").strip()
+        if value:
+            return value
+    text = "\n".join(
+        str(message.get(key) or "")
+        for key in ("subject", "body", "body_preview", "text", "content")
+    )
+    if not text.strip():
+        return ""
+    from icloud_mail import ICloudMail
+
+    return ICloudMail.extract_verification_code(text)
 
 def _sort_key(item: Dict) -> str:
     return f"{item.get('created_at') or ''}|{item.get('alias_email') or ''}"
@@ -415,3 +457,19 @@ def _sort_key(item: Dict) -> str:
 
 def _normalize_alias(alias_email: str) -> str:
     return str(alias_email or "").strip().lower()
+
+
+
+def _message_matches_alias(message: Dict, alias: str) -> bool:
+    alias = _normalize_alias(alias)
+    if not alias:
+        return False
+    if _normalize_alias(message.get("matched_recipient", "")) == alias:
+        return True
+    haystack = "\n".join(
+        str(message.get(key) or "")
+        for key in ("recipient_headers", "to")
+        if message.get(key)
+    )
+    addresses = {addr.lower() for _name, addr in getaddresses([haystack]) if addr}
+    return alias in addresses or alias in haystack.lower()
