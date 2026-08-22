@@ -71,9 +71,49 @@ AUTOSTART_MODE=systemd scripts/install-autostart-service.sh
 AUTOSTART_MODE=windows-task TASK_NAME="iCloud HME Web UI" scripts/install-autostart-service.sh
 ```
 
-调度规则：只调度活跃账号；单账号本地/刷新后的 `alias_total >= 750` 时跳过，不再创建新 HME。
+调度规则：只调度活跃账号；单账号本地/刷新后的 `alias_total >= 750` 时跳过，不再创建新 HME。若某轮没有任何可调度账号，会在运行日志里写明原因（达上限几个、非 active 几个及各自状态），不再静默空转。
+
+### 运行日志
+
+日志同时进内存缓冲和磁盘。磁盘按天写 `logs/app-YYYYMMDD.jsonl`，一行一条 JSON，进程重启后 UI 仍能读到当天已有日志，并可在「运行日志」页切换日期回看历史。
+
+```bash
+HME_LOG_RETENTION_DAYS=7    # 保留天数，默认 7；启动时与跨天时各清理一次
+```
+
+Docker 下 `logs/` 位于 `/data`，随命名卷持久化。
+
+### 创建节流
+
+连续无间隔创建会被 Apple 限流。单账号内每次创建之间的间隔由环境变量控制：
+
+```bash
+HME_CREATE_INTERVAL_SEC=20  # 默认 20 秒
+```
+
+批量创建页走 SSE 流式接口，边建边推送每个邮箱的成败，触达 Apple 创建上限时立即停止该账号，不再继续撞墙。
 
 服务单元会使用项目目录的 `.venv/bin/python`（如存在），否则使用当前 `python`，并设置 `PYTHONPATH` 与 `RequiresMountsFor`，避免开机时项目目录或依赖未就绪导致服务启动失败。WSL 登录自启任务使用同一 Python 选择规则，并把输出写入 `logs/web_ui.autostart.log`。
+
+### Docker 部署
+
+项目可以打包为 Docker。账号、API Key、shared 记录、缓存和日志统一保存在 `/data`，通过命名卷持久化，容器删除或升级不会丢失运行数据。
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl http://127.0.0.1:5050/
+```
+
+默认访问 `http://127.0.0.1:5050`。修改端口：
+
+```bash
+PORT=8080 docker compose up -d --build
+```
+
+停止服务但保留数据：`docker compose down`。删除数据卷前请先备份：`docker volume ls`。
+
+容器无法使用 Windows Chrome Cookie 自动提取；请在 Web UI 中导入 Cookie，或通过 API 导入。
 
 
 ### 命令行调度器

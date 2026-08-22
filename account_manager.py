@@ -30,12 +30,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 HERE = Path(__file__).resolve().parent
-ACCOUNTS_FILE = HERE / "accounts.json"
-OLD_COOKIES_FILE = HERE / "cookies.json"
-RESULTS_DIR = HERE / "results"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+OLD_COOKIES_FILE = DATA_DIR / "cookies.json"
+RESULTS_DIR = DATA_DIR / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
 SCHEDULER_ALIAS_LIMIT = int(os.environ.get("HME_SCHEDULER_ALIAS_LIMIT", "750"))
 SCHEDULER_REFRESH_MARGIN = int(os.environ.get("HME_SCHEDULER_REFRESH_MARGIN", "5"))
+CREATE_INTERVAL_SEC = float(os.environ.get("HME_CREATE_INTERVAL_SEC", "20"))
 DEFAULT_GROUP_ID = "grp_default"
 DEFAULT_GROUP_NAME = "可用"
 DEFAULT_GROUP_COLOR = "#1f8b4c"
@@ -658,6 +660,17 @@ class AccountManager:
                 return existing
         return None
 
+    def _find_blocking_duplicate(self, account: Dict) -> Optional[Dict]:
+        """判重时只让"仍可用"的同身份账号构成冲突。
+
+        两份 cookie 指向同一 Apple 身份时，旧逻辑会把双方都降级为 error 并互相
+        引用，谁都无法恢复。只在对方仍是 active 时才降级，可留出自愈路径。
+        """
+        duplicate = self._find_account_by_identity(account)
+        if duplicate and duplicate.get("status") == "active":
+            return duplicate
+        return None
+
     @staticmethod
     def parse_cookie_input(raw: str) -> Dict[str, str]:
         raw = raw.strip()
@@ -855,7 +868,7 @@ class AccountManager:
         with self._lock:
             if acc_id not in self.accounts:
                 raise KeyError(f"账号不存在: {acc_id}")
-            duplicate = self._find_account_by_identity(account)
+            duplicate = self._find_blocking_duplicate(account)
             if duplicate and duplicate.get("id") != acc_id:
                 label = duplicate.get("name") or duplicate.get("real_email") or duplicate.get("id")
                 raise ValueError(f"该会话属于已存在账号: {label}")
@@ -1072,7 +1085,7 @@ class AccountManager:
                 if current_version != int(expected_session_version):
                     return dict(current)
             if check_duplicate:
-                duplicate = self._find_account_by_identity(working)
+                duplicate = self._find_blocking_duplicate(working)
                 if duplicate and duplicate.get("id") != acc_id:
                     working["status"] = "error"
                     working["validation_status"] = "error"
@@ -1403,6 +1416,9 @@ class AccountManager:
 
         results: List[Dict] = []
         for i in range(count):
+            # 连续无间隔创建必被 Apple 限流；调度器路径本就有间隔，这里补齐。
+            if i > 0 and CREATE_INTERVAL_SEC > 0:
+                time.sleep(CREATE_INTERVAL_SEC)
             try:
                 alias_label = label or (
                     f"{account.get('name', acc_id)} "

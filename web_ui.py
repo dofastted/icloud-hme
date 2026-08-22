@@ -12,14 +12,16 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template, g
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
+from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, CREATE_INTERVAL_SEC, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
-from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
+from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService, normalize_mailbox_sort
+from run_log import RunLogStore, date_key
 from shared_mailboxes import SharedMailboxStore
 
 # ---- config ----
-RESULTS_DIR = HERE / "results"
-LOGS_DIR = HERE / "logs"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+RESULTS_DIR = DATA_DIR / "results"
+LOGS_DIR = DATA_DIR / "logs"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 SCHEDULER_WINDOW_START_HOUR = 7
 SCHEDULER_WINDOW_END_HOUR = 20
@@ -32,7 +34,6 @@ app = Flask(__name__)
 _log_queue = queue.Queue()
 _log_buffer = deque(maxlen=500)
 _log_lock = threading.Lock()
-_log_seq = 0
 _today_key = datetime.now().strftime("%Y%m%d")
 _global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
 _lock = threading.Lock()
@@ -42,10 +43,15 @@ _validation_lock = threading.Lock()
 _validation_jobs = {}
 _scheduler_thread = None
 _stop_event = threading.Event()
+_health_stop_event = threading.Event()
 _account_mgr = AccountManager()
 _api_keys = APIKeyStore()
 _shared_store = SharedMailboxStore()
 _mailbox_service = MailboxService(_account_mgr, _shared_store)
+_log_store = RunLogStore(LOGS_DIR)
+_log_date = date_key()
+_log_seq = _log_store.last_seq(_log_date)
+_log_store.cleanup()
 
 @app.errorhandler(KeyError)
 def _handle_key_error(err):
@@ -329,22 +335,47 @@ def _next_scheduler_window_start(now: datetime | None = None) -> datetime:
         return current.replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
     return (current + timedelta(days=1)).replace(hour=SCHEDULER_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
 
-def _emit_log(level, msg):
-    global _log_seq
-    entry = {"time":_now().strftime("%H:%M:%S"),"level":level,"msg":msg}
+def _emit_log(level, msg, tag: str = ""):
+    global _log_seq, _log_date
+    now = _now()
+    entry = {"time":now.strftime("%H:%M:%S"),"level":level,"msg":msg}
+    if tag:
+        entry["tag"] = tag
     with _log_lock:
+        today = date_key(now)
+        if today != _log_date:
+            _log_date = today
+            _log_seq = 0
+            rotated = True
+        else:
+            rotated = False
         _log_seq += 1
         entry["seq"] = _log_seq
+        entry["date"] = today
+        entry["ts"] = now.isoformat(timespec="seconds")
         _log_buffer.append(dict(entry))
+    if rotated:
+        _log_store.cleanup(now)
+    try:
+        _log_store.append(entry, now)
+    except OSError:
+        pass
     _log_queue.put(entry)
+    return entry
 
 
-def _log_entries(limit: int = 200, since: int = 0):
+def _log_entries(limit: int = 200, since: int = 0, date: str = ""):
     limit = max(1, min(int(limit or 200), 500))
     since = max(0, int(since or 0))
+    date = str(date or "").strip()
+    if date and date != _log_date:
+        return _log_store.read(date, limit=limit, since=since)
     with _log_lock:
         entries = [dict(item) for item in _log_buffer if int(item.get("seq") or 0) > since]
-    return entries[-limit:]
+    if entries or since:
+        return entries[-limit:]
+    # 进程重启后内存缓冲为空，回读当天落盘日志。
+    return _log_store.read(_log_date, limit=limit, since=since)
 
 
 def _start_validation_worker():
@@ -467,6 +498,20 @@ def _create_scheduled_alias(acc_id: str, acc_name: str) -> tuple[bool, str]:
 
 def _scheduler_loop():
     """后台调度器：北京时间 7:00-20:00，随机间隔 60-90min，每账号随机 3-5 个。"""
+    try:
+        _scheduler_cycle()
+    except BaseException as exc:
+        # 线程一旦静默死亡，UI 会长期显示"运行中"却不干活，必须留痕。
+        _update_state(running=False, creating=False, next_trigger=None,
+                      round_status=f"调度器异常退出: {str(exc)[:120]}",
+                      last_error=str(exc)[:300])
+        _emit_log("error", f"调度器异常退出: {str(exc)[:200]}")
+        raise
+    _update_state(running=False, next_trigger=None, round_status="已停止")
+    _emit_log("info", "调度器已停止")
+
+
+def _scheduler_cycle():
     import random as _random
     _update_state(running=True, round_status="等待触发窗口")
     _emit_log("info", f"调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个，单账号达到 {SCHEDULER_ALIAS_LIMIT} 跳过)")
@@ -485,7 +530,13 @@ def _scheduler_loop():
         active_accounts = scheduler_eligible_accounts(accounts)
         skipped = len([a for a in accounts if a.get("status") == "active" and account_reached_scheduler_limit(a)])
         if not active_accounts:
-            _update_state(creating=False, round_status=f"无可调度账号，已达到上限 {skipped} 个")
+            blocked = [a for a in accounts if a.get("status") != "active"]
+            note = f"无可调度账号：达上限 {skipped} 个，非 active {len(blocked)} 个"
+            _update_state(creating=False, round_status=note)
+            _emit_log("warn", note + (
+                "；" + "、".join(f"{a.get('name', a['id'])}({a.get('status')})" for a in blocked[:5])
+                if blocked else ""
+            ))
             _stop_event.wait(1800)
             continue
         round_total = 0
@@ -529,19 +580,18 @@ def _scheduler_loop():
         _update_state(next_trigger=target.timestamp())
         _emit_log("info", f"下轮 {target.strftime('%H:%M')} (间隔 {interval_sec//60}min)")
         _stop_event.wait(interval_sec)
-    _update_state(running=False, next_trigger=None, round_status="已停止")
-    _emit_log("info", "调度器已停止")
 
 def _health_loop():
     _error_reported = set()
     # After reboot, proxy/network may not be ready; avoid immediate demotion storms.
     first_delay_sec = int(os.environ.get("HME_HEALTH_FIRST_DELAY_SEC", "600"))
     interval_sec = int(os.environ.get("HME_HEALTH_INTERVAL_SEC", "1800"))
-    if _stop_event.wait(max(60, first_delay_sec)):
+    if _health_stop_event.wait(max(60, first_delay_sec)):
         return
-    while not _stop_event.is_set():
+    while not _health_stop_event.is_set():
         for account in _account_mgr.list_accounts():
-            if account.get("status") != "active":
+            # error 账号也要复查，否则一次网络抖动后永远无法自愈。
+            if account.get("status") not in ("active", "error"):
                 continue
             try:
                 queued = _queue_account_validation(account["id"], "health")
@@ -554,7 +604,7 @@ def _health_loop():
                         f"健康检查排队失败 [{account.get('name', '?')}]: {str(e)[:100]}",
                     )
                     _error_reported.add(account["id"])
-        if _stop_event.wait(max(300, interval_sec)):
+        if _health_stop_event.wait(max(300, interval_sec)):
             break
 
 # ----- Flask Routes -----
@@ -792,18 +842,20 @@ def api_v1_verification_codes(acc_id):
 
 def _mailbox_list_payload():
     refresh = request.args.get("refresh", "0") == "1"
+    sort = request.args.get("sort", "") or request.args.get("order", "")
     items = _mailbox_service.list_mailboxes(
         q=request.args.get("q", ""),
         account_id=request.args.get("account_id", "") or request.args.get("account", ""),
         group_id=request.args.get("group_id", "") or request.args.get("group", ""),
         status=request.args.get("status", ""),
         refresh=refresh,
+        sort=sort,
     )
     total = len(items)
     page, limit, offset = _paginate(items)
     meta = _mailbox_service.local_metadata()
     meta["refreshed"] = refresh
-    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh,"source":meta["source"],"index_updated_at":meta.get("index_updated_at"),"local_alias_count":meta.get("local_alias_count",0),"index_alias_count":meta.get("index_alias_count",0)}
+    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh,"sort":normalize_mailbox_sort(sort),"source":meta["source"],"index_updated_at":meta.get("index_updated_at"),"local_alias_count":meta.get("local_alias_count",0),"index_alias_count":meta.get("index_alias_count",0)}
 
 @app.route("/api/v1/mailboxes")
 @_require_api_key
@@ -951,11 +1003,19 @@ def shared_page(shared_key):
 @app.route("/api/state")
 def api_state():
     summary = _account_mgr.get_summary()
+    alive = bool(_scheduler_thread and _scheduler_thread.is_alive())
     with _lock:
         state = dict(_global_state); state.update(summary)
         state["cookies_ok"] = summary["active_accounts"] > 0
         state["alias_count"] = summary["total_aliases"]
         state["alias_active"] = summary["total_active_aliases"]
+        # 线程可能已静默退出，以真实存活状态为准。
+        if state.get("running") and not alive:
+            _global_state["running"] = False
+            state["running"] = False
+            state["round_status"] = state.get("round_status") or "调度器线程已结束"
+        state["scheduler_alive"] = alive
+        state["log_retention_days"] = _log_store.retention_days
     return jsonify(state)
 
 @app.route("/api/accounts")
@@ -1200,18 +1260,103 @@ def api_create_batch():
     interval = float(data.get("interval",3.0))
     if not account_ids: return jsonify({"ok":False,"error":"请选择至少一个账号"})
     _update_state(creating=True)
-    _emit_log("info",f"批量创建: {len(account_ids)} 个账号 x{count}")
+    _emit_log("info",f"批量创建: {len(account_ids)} 个账号 x{count}", tag="batch")
     try:
         all_results = _account_mgr.create_aliases_batch(account_ids, count, interval, label)
         total_created = sum(sum(1 for r in results if r.get("ok")) for results in all_results.values())
         total_errors = sum(sum(1 for r in results if not r.get("ok")) for results in all_results.values())
         _update_state(creating=False)
         _increment_state(today_created=total_created, total_created=total_created)
-        _emit_log("success",f"批量完成: {total_created} 成功 / {total_errors} 失败")
-        return jsonify({"ok":True,"total_created":total_created,"total_errors":total_errors,"results":{acc_id:[{"email":r.get("email"),"ok":r.get("ok"),"error":r.get("error")} for r in results] for acc_id,results in all_results.items()}})
+        first_error = next(
+            (r.get("error") for results in all_results.values() for r in results if not r.get("ok")),
+            None,
+        )
+        # 一个都没建出来就是失败，不能报 success。
+        _emit_log(
+            "success" if total_errors == 0 else ("warn" if total_created else "error"),
+            f"批量完成: {total_created} 成功 / {total_errors} 失败"
+            + (f"；首个错误: {str(first_error)[:120]}" if first_error else ""),
+            tag="batch",
+        )
+        return jsonify({"ok":total_created>0,"total_created":total_created,"total_errors":total_errors,"error":first_error if total_created==0 else None,"results":{acc_id:[{"email":r.get("email"),"ok":r.get("ok"),"error":r.get("error")} for r in results] for acc_id,results in all_results.items()}})
     except Exception as e:
         _update_state(creating=False)
+        _emit_log("error", f"批量创建异常: {str(e)[:200]}", tag="batch")
         return jsonify({"ok":False,"error":str(e)})
+
+
+@app.route("/api/create-batch-stream", methods=["POST"])
+def api_create_batch_stream():
+    """批量创建 SSE：边建边推送每个邮箱的成败，供前端实时展示。"""
+    data = request.get_json() or {}
+    account_ids = [str(a) for a in (data.get("account_ids") or []) if a]
+    count = max(1, min(int(data.get("count_per_account", 5) or 1), 20))
+    label = str(data.get("label", "") or "")
+    interval = max(0.0, float(data.get("interval", CREATE_INTERVAL_SEC) or 0))
+
+    def event(payload):
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def generate():
+        if not account_ids:
+            yield event({"type":"error","error":"请选择至少一个账号"})
+            return
+        planned = len(account_ids) * count
+        yield event({"type":"start","accounts":len(account_ids),"count_per_account":count,"planned":planned})
+        _update_state(creating=True)
+        _emit_log("info", f"批量创建: {len(account_ids)} 个账号 x{count}", tag="batch")
+        total_created = 0
+        total_errors = 0
+        try:
+            for acc_id in account_ids:
+                account = _account_mgr.get_account(acc_id)
+                name = (account or {}).get("name") or acc_id
+                if not account:
+                    total_errors += 1
+                    entry = _emit_log("error", f"[{name}] 账号不存在", tag="batch")
+                    yield event({"type":"item","account_id":acc_id,"account_name":name,"ok":False,"error":"账号不存在","log":entry})
+                    continue
+                if account.get("status") != "active":
+                    total_errors += 1
+                    reason = f"账号不可用 (status={account.get('status')})"
+                    entry = _emit_log("error", f"[{name}] {reason}", tag="batch")
+                    yield event({"type":"item","account_id":acc_id,"account_name":name,"ok":False,"error":reason,"log":entry})
+                    continue
+                yield event({"type":"account","account_id":acc_id,"account_name":name,"target":count})
+                for index in range(count):
+                    ok, message = _create_scheduled_alias(acc_id, label or name)
+                    if ok:
+                        total_created += 1
+                        _increment_state(today_created=1, total_created=1)
+                        entry = _emit_log("success", f"[{name}] ({index+1}/{count}) {message}", tag="batch")
+                        yield event({"type":"item","account_id":acc_id,"account_name":name,"ok":True,"email":message,"index":index+1,"log":entry})
+                    else:
+                        total_errors += 1
+                        limited = _is_limit_error(message)
+                        entry = _emit_log(
+                            "warn" if limited else "error",
+                            f"[{name}] ({index+1}/{count}) 失败: {message[:120]}",
+                            tag="batch",
+                        )
+                        yield event({"type":"item","account_id":acc_id,"account_name":name,"ok":False,"error":message[:200],"index":index+1,"limited":limited,"log":entry})
+                        if limited:
+                            yield event({"type":"account-stop","account_id":acc_id,"account_name":name,"reason":"触达创建限制"})
+                            break
+                    if index < count - 1 and interval > 0:
+                        time.sleep(interval)
+        except Exception as exc:
+            _emit_log("error", f"批量创建异常: {str(exc)[:200]}", tag="batch")
+            yield event({"type":"error","error":str(exc)[:200]})
+        finally:
+            _update_state(creating=False)
+        _emit_log(
+            "success" if total_errors == 0 and total_created else ("warn" if total_created else "error"),
+            f"批量完成: {total_created} 成功 / {total_errors} 失败",
+            tag="batch",
+        )
+        yield event({"type":"done","total_created":total_created,"total_errors":total_errors,"ok":total_created>0})
+
+    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 
 @app.route("/api/accounts/<acc_id>/inbox")
@@ -1350,8 +1495,9 @@ def api_scheduler_stop():
 def api_logs():
     limit = request.args.get("limit", 200, type=int)
     since = request.args.get("since", 0, type=int)
-    entries = _log_entries(limit=limit, since=since)
-    return jsonify({"ok":True,"logs":entries,"count":len(entries),"last_seq":entries[-1]["seq"] if entries else since})
+    date = request.args.get("date", "", type=str)
+    entries = _log_entries(limit=limit, since=since, date=date)
+    return jsonify({"ok":True,"logs":entries,"count":len(entries),"date":date or _log_date,"dates":_log_store.available_dates(),"retention_days":_log_store.retention_days,"last_seq":entries[-1]["seq"] if entries else since})
 
 
 @app.route("/api/log-stream")
@@ -1382,7 +1528,7 @@ def main():
     if _auto_start_scheduler_requested(args):
         started = _start_scheduler_thread()
         print("[+] Scheduler auto-started" if started else "[+] Scheduler already running")
-    def _shutdown(sig,frame): print("\n[*] Shutting down..."); _stop_event.set(); os._exit(0)
+    def _shutdown(sig,frame): print("\n[*] Shutting down..."); _stop_event.set(); _health_stop_event.set(); os._exit(0)
     _signal.signal(_signal.SIGINT, _shutdown)
     _signal.signal(_signal.SIGTERM, _shutdown)
     try:

@@ -1,22 +1,83 @@
 (function(){
   const S = window.HME;
   S.logPaused = false;
+  S.logDate = '';
+  let batchRunning = false;
 
   S.renderBatch = function(){
     S.setTitle('批量创建');
-    const checks = S.accounts.map(a => '<label><input type="checkbox" name="batchAcc" value="' + S.esc(a.id) + '"> ' + S.esc(a.name || a.id) + '</label>').join('<br>');
-    S.view('<div class="panel"><div class="panel-head">批量创建</div><div class="panel-body">' + (checks || S.empty('暂无账号')) + '<div style="height:14px"></div><input id="batchCount" type="number" min="1" max="20" value="1"> <input id="batchLabel" placeholder="标签，可选"> <button class="btn" onclick="HME.runBatch()">开始创建</button><div id="batchResult" class="muted mono" style="margin-top:14px"></div></div></div>');
+    const checks = S.accounts.map(a => '<label><input type="checkbox" name="batchAcc" value="' + S.esc(a.id) + '"' + (a.status === 'active' ? '' : ' disabled') + '> ' + S.esc(a.name || a.id) + (a.status === 'active' ? '' : ' <span class="badge err">' + S.esc(a.status || '不可用') + '</span>') + '</label>').join('<br>');
+    S.view('<div class="panel"><div class="panel-head">批量创建</div><div class="panel-body">' + (checks || S.empty('暂无账号')) + '<div style="height:14px"></div><input id="batchCount" type="number" min="1" max="20" value="1"> <input id="batchLabel" placeholder="标签，可选"> <button id="batchRun" class="btn" onclick="HME.runBatch()">开始创建</button><div id="batchResult" class="muted mono" style="margin-top:14px"></div></div></div><div class="panel"><div class="panel-head"><span>运行日志</span><span class="muted mono" id="batchProgress"></span></div><div class="panel-body mono" id="batchFeed" style="max-height:340px;overflow:auto">' + S.empty('开始创建后在此实时显示') + '</div></div>');
   };
 
+  function batchAppend(entry){
+    const feed = S.E('batchFeed');
+    if (!feed) return;
+    if (feed.querySelector('.empty')) feed.innerHTML = '';
+    feed.insertAdjacentHTML('beforeend', logLine(entry));
+    feed.scrollTop = feed.scrollHeight;
+  }
+
   S.runBatch = async function(){
+    if (batchRunning) return;
+    const btn = S.E('batchRun');
+    const result = S.E('batchResult');
     try {
       const account_ids = Array.from(document.querySelectorAll('input[name=batchAcc]:checked')).map(x => x.value);
       if (!account_ids.length) throw new Error('请选择账号');
-      const data = await S.api('/api/create-batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({account_ids, count_per_account:Number(S.E('batchCount').value || 1), label:S.E('batchLabel').value || ''})});
-      S.E('batchResult').textContent = '成功 ' + data.total_created + '，失败 ' + data.total_errors;
+      const count = Number(S.E('batchCount').value || 1);
+      batchRunning = true;
+      if (btn) { btn.disabled = true; btn.textContent = '创建中...'; }
+      S.E('batchFeed').innerHTML = '';
+      result.textContent = '';
+      const summary = await streamBatch({account_ids, count_per_account:count, label:S.E('batchLabel').value || ''});
+      result.textContent = '成功 ' + summary.total_created + '，失败 ' + summary.total_errors;
+      S.toast(summary.ok ? ('创建 ' + summary.total_created + ' 个') : '创建失败，详见日志', !summary.ok);
       S.refreshAll();
-    } catch (err) { S.E('batchResult').textContent = err.message; }
+    } catch (err) {
+      result.textContent = err.message;
+      S.toast(err.message, true);
+    } finally {
+      batchRunning = false;
+      if (btn) { btn.disabled = false; btn.textContent = '开始创建'; }
+    }
   };
+
+  async function streamBatch(payload){
+    const res = await fetch('/api/create-batch-stream', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let done = null;
+    let failed = null;
+    let created = 0;
+    const planned = payload.account_ids.length * payload.count_per_account;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, {stream:true});
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        const line = part.split('\n').find(l => l.startsWith('data:'));
+        if (!line) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+        if (evt.type === 'error') { failed = evt.error; continue; }
+        if (evt.type === 'done') { done = evt; continue; }
+        if (evt.log) batchAppend(evt.log);
+        if (evt.type === 'item') {
+          if (evt.ok) created += 1;
+          const prog = S.E('batchProgress');
+          if (prog) prog.textContent = created + ' / ' + planned;
+        }
+      }
+    }
+    if (failed) throw new Error(failed);
+    if (!done) throw new Error('连接中断，请查看运行日志');
+    return done;
+  }
 
   function inboxTable(msgs){
     return '<table class="table"><tbody>' + msgs.map(m => '<tr><td><strong>' + S.esc(m.subject || '(无主题)') + '</strong><br><span class="muted">' + S.esc(m.from || '') + '</span><br><span class="muted mono">To: ' + S.esc(m.to || '') + '</span></td><td>' + S.esc(m.date || '') + '</td></tr>').join('') + '</tbody></table>';
@@ -112,11 +173,19 @@
     feed.scrollTop = feed.scrollHeight;
   }
 
+  function logDateOptions(){
+    const dates = S.logDates || [];
+    if (!dates.length) return '';
+    const opts = dates.map(d => '<option value="' + S.esc(d) + '"' + (S.logDate === d ? ' selected' : '') + '>' + S.esc(d.slice(0,4) + '-' + d.slice(4,6) + '-' + d.slice(6,8)) + '</option>').join('');
+    return '<select id="logDate" onchange="HME.loadLogHistory(this.value)">' + opts + '</select> ';
+  }
+
   S.renderLogs = function(){
     S.setTitle('运行日志');
     const rows = S.logs.length ? S.logs.map(logLine).join('') : S.empty('等待日志');
     const pauseLabel = S.logPaused ? '继续' : '暂停';
-    S.view('<div class="panel"><div class="panel-head"><span>运行日志</span><span><button class="btn btn-outline btn-sm" onclick="HME.loadLogHistory()">加载历史</button> <button class="btn btn-outline btn-sm" onclick="HME.toggleLogPause()">' + pauseLabel + '</button> <button class="btn btn-outline btn-sm" onclick="HME.clearLogs()">清空</button></span></div><div class="panel-body mono" id="logFeed">' + rows + '</div></div>');
+    const retention = S.logRetentionDays ? '<span class="muted mono" style="font-size:12px">保留 ' + S.logRetentionDays + ' 天</span> ' : '';
+    S.view('<div class="panel"><div class="panel-head"><span>运行日志</span><span>' + retention + logDateOptions() + '<button class="btn btn-outline btn-sm" onclick="HME.loadLogHistory()">刷新</button> <button class="btn btn-outline btn-sm" onclick="HME.toggleLogPause()">' + pauseLabel + '</button> <button class="btn btn-outline btn-sm" onclick="HME.clearLogs()">清空</button></span></div><div class="panel-body mono" id="logFeed">' + rows + '</div></div>');
     const feed = S.E('logFeed');
     if (feed) feed.scrollTop = feed.scrollHeight;
   };
@@ -131,13 +200,17 @@
     S.renderLogs();
   };
 
-  S.loadLogHistory = async function(){
+  S.loadLogHistory = async function(date){
     if (typeof fetch !== 'function') return;
     try {
-      const res = await fetch('/api/logs?limit=200');
+      const target = typeof date === 'string' ? date : S.logDate;
+      const res = await fetch('/api/logs?limit=500' + (target ? '&date=' + encodeURIComponent(target) : ''));
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
       S.logs = data.logs || [];
+      S.logDates = data.dates || [];
+      S.logDate = data.date || '';
+      S.logRetentionDays = data.retention_days || 0;
       if ((location.hash || '').startsWith('#/logs')) S.renderLogs();
     } catch (err) { S.toast && S.toast(err.message, true); }
   };
@@ -153,4 +226,5 @@
   }
 
   connectLogs();
+  S.loadLogHistory();
 })();

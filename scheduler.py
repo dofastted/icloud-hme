@@ -23,9 +23,10 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh
 
-LOG_DIR = HERE / "logs"
-RESULT_DIR = HERE / "results"
-STATE_FILE = HERE / "scheduler_state.json"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+LOG_DIR = DATA_DIR / "logs"
+RESULT_DIR = DATA_DIR / "results"
+STATE_FILE = DATA_DIR / "scheduler_state.json"
 
 def setup_logging(verbose: bool = True) -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True); RESULT_DIR.mkdir(parents=True, exist_ok=True)
