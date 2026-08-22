@@ -1436,7 +1436,8 @@ class AccountManager:
                     results.append(item)
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
-                        f.write(f"{email}\t{acc_id}\n")
+                        # 第三列为创建时间毫秒；缺了它列表就无法按时间排序。
+                        f.write(f"{email}\t{acc_id}\t{int(time.time() * 1000)}\n")
                     account["alias_total"] = account.get("alias_total", 0) + 1
                     account["alias_active"] = account.get("alias_active", 0) + 1
                 else:

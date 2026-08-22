@@ -251,3 +251,47 @@ def test_mailbox_service_not_found_and_imap_errors(tmp_path):
     assert str(excinfo.value) == "邮件读取暂不可用"
     assert "邮件登录失败" not in str(excinfo.value)
     assert "邮件认证凭据" not in str(excinfo.value)
+
+
+def write_index(tmp_path, mailboxes):
+    index = tmp_path / "mailbox_index.json"
+    index.write_text(
+        json.dumps({"mailboxes": mailboxes, "updated_at": "2026-01-01T00:00:00"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    latest = tmp_path / "latest_emails.txt"
+    latest.write_text("", encoding="utf-8")
+    return latest, index
+
+
+def test_list_mailboxes_sorts_by_created_time(tmp_path):
+    latest, index = write_index(tmp_path, {
+        "old@icloud.com": {
+            "alias_email": "old@icloud.com",
+            "account_id": "acc_1",
+            "created_at": 1700000000000,
+            "is_active": True,
+        },
+        "new@icloud.com": {
+            "alias_email": "new@icloud.com",
+            "account_id": "acc_1",
+            "created_at": 1783932943138,
+            "is_active": True,
+        },
+        "mid@icloud.com": {
+            "alias_email": "mid@icloud.com",
+            "account_id": "acc_1",
+            "created_at": "2025-06-01T00:00:00",
+            "is_active": True,
+        },
+    })
+    svc = MailboxService(FakeManager(), latest_emails_path=latest, index_path=index)
+
+    newest = [item["alias_email"] for item in svc.list_mailboxes()]
+    oldest = [item["alias_email"] for item in svc.list_mailboxes(sort="created_at_asc")]
+    by_alias = [item["alias_email"] for item in svc.list_mailboxes(sort="alias")]
+
+    assert newest == ["new@icloud.com", "mid@icloud.com", "old@icloud.com"]
+    assert oldest == ["old@icloud.com", "mid@icloud.com", "new@icloud.com"]
+    assert by_alias == ["mid@icloud.com", "new@icloud.com", "old@icloud.com"]
+

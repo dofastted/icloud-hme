@@ -72,7 +72,13 @@ class MailboxService:
         self.index_path = Path(index_path)
 
     def list_mailboxes(
-        self, q: str = "", account_id: str = "", group_id: str = "", status: str = "", refresh: bool = False
+        self,
+        q: str = "",
+        account_id: str = "",
+        group_id: str = "",
+        status: str = "",
+        refresh: bool = False,
+        sort: str = "",
     ) -> List[Dict]:
         accounts = {a.get("id"): a for a in self.account_mgr.list_accounts()}
         by_alias: Dict[str, Dict] = {}
@@ -116,7 +122,8 @@ class MailboxService:
             elif normalized in ("inactive", "disabled", "revoked"):
                 items = [item for item in items if item.get("is_active") is False]
 
-        return sorted(items, key=_sort_key, reverse=True)
+        sort_mode = normalize_mailbox_sort(sort)
+        return sorted(items, key=lambda item: _mailbox_sort_key(item, sort_mode))
 
     def refresh_mailboxes(self) -> List[Dict]:
         return self.list_mailboxes(refresh=True)
@@ -323,15 +330,21 @@ class MailboxService:
             lines = self.latest_emails_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
-        for line in lines:
+        for position, line in enumerate(lines):
             parts = line.strip().split("\t")
             if not parts or "@" not in parts[0]:
                 continue
-            items.append({
+            item = {
                 "alias_email": _normalize_alias(parts[0]),
                 "account_id": parts[1] if len(parts) > 1 else "",
                 "source": "local",
-            })
+            }
+            # 第三列是创建时间（新格式）；旧的两列记录没有时间，
+            # 用追加顺序兜底，至少保证新建的排在旧的前面而不是沉底。
+            created_at = _created_at_ms(parts[2]) if len(parts) > 2 else 0.0
+            item["created_at"] = created_at or float(position + 1)
+            item["created_at_estimated"] = not created_at
+            items.append(item)
         return items
 
     def _merge_source(self, by_alias: Dict[str, Dict], accounts: Dict[str, Dict], source: Dict):
@@ -345,6 +358,14 @@ class MailboxService:
         for key, value in summary.items():
             if key == "is_active" or value not in (None, ""):
                 merged[key] = value
+        # 本地文件的估算时间不得覆盖索引/远端的真实创建时间。
+        if (
+            source.get("created_at_estimated")
+            and existing.get("created_at")
+            and not existing.get("created_at_estimated")
+        ):
+            merged["created_at"] = existing["created_at"]
+            merged["created_at_estimated"] = False
         by_alias[alias] = merged
 
     def _mailbox_group_fields(self, alias: str, source: Dict) -> Dict:
@@ -379,6 +400,7 @@ class MailboxService:
             **group_fields,
             "is_active": bool(is_active),
             "created_at": source.get("createTimestamp") or source.get("createdAt") or source.get("created_at") or "",
+            "created_at_estimated": bool(source.get("created_at_estimated")),
             "source": source.get("source") or "local",
             "shared": None,
         }
@@ -451,8 +473,47 @@ def _extract_message_otp(message: Dict) -> str:
 
     return ICloudMail.extract_verification_code(text)
 
-def _sort_key(item: Dict) -> str:
-    return f"{item.get('created_at') or ''}|{item.get('alias_email') or ''}"
+def normalize_mailbox_sort(sort: str) -> str:
+    raw = str(sort or "").strip().lower()
+    if raw in ("created_at_asc", "oldest", "time_asc", "created_asc"):
+        return "created_at_asc"
+    if raw in ("alias", "email", "hme", "address"):
+        return "alias"
+    return "created_at"
+
+
+def _created_at_ms(value) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number <= 0:
+            return 0.0
+        if number < 1e12:
+            return number * 1000.0
+        return number
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    if text.isdigit():
+        return _created_at_ms(int(text))
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return parsed.timestamp() * 1000.0
+
+
+def _mailbox_sort_key(item: Dict, sort: str):
+    alias = str(item.get("alias_email") or "")
+    created = _created_at_ms(item.get("created_at"))
+    if sort == "alias":
+        return (alias, -created)
+    if sort == "created_at_asc":
+        return (created, alias)
+    return (-created, alias)
 
 
 def _normalize_alias(alias_email: str) -> str:
