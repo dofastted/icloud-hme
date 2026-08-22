@@ -8,6 +8,7 @@ Only SHA-256 digests are persisted. The raw shared key is returned once from
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import threading
 from datetime import datetime
@@ -15,7 +16,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
-SHARED_MAILBOXES_FILE = HERE / "shared_mailboxes.json"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+SHARED_MAILBOXES_FILE = DATA_DIR / "shared_mailboxes.json"
 KEY_PREFIX = "shk_"
 
 

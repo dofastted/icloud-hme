@@ -8,13 +8,15 @@ iCloud HME — 邮件本地缓存
 """
 
 import json
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
-CACHE_FILE = HERE / "results" / "mail_cache.json"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+CACHE_FILE = DATA_DIR / "results" / "mail_cache.json"
 
 
 class MailCache:

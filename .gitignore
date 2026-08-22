@@ -12,6 +12,7 @@ __pycache__/
 
 # Backups
 backup/
+backups/
 
 # Sensitive — never commit
 logs/

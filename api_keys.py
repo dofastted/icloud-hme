@@ -7,6 +7,7 @@
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import threading
 from datetime import datetime
@@ -14,7 +15,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
-API_KEYS_FILE = HERE / "api_keys.json"
+DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
+API_KEYS_FILE = DATA_DIR / "api_keys.json"
 KEY_PREFIX = "hme_"
 
 

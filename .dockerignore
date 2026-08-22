@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.git/
+.pytest_cache/
+logs/
+results/
+accounts.json
+api_keys.json
+shared_mailboxes.json
+scheduler_state.json
+cookies.json
+icloud_cookies.json
+test-acc-session.txt

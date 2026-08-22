@@ -1,0 +1,21 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icloud-hme:latest
+    container_name: icloud-hme
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5050}:5050"
+    environment:
+      HME_DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: 5050
+      AUTO_START_SCHEDULER: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - icloud_hme_data:/data
+
+volumes:
+  icloud_hme_data:
