@@ -22,6 +22,16 @@ class CachedMessageCache:
         ]
 
 
+class ProviderMessageCache(CachedMessageCache):
+    def get_alias_mail(self, _acc_id, alias):
+        if alias == "alias@icloud.com":
+            return [
+                {"id": "claude", "subject": "Claude sign-in", "date": "2026-01-04"},
+                {"id": "openai", "body": "OpenAI verification", "date": "2026-01-03"},
+            ]
+        return []
+
+
 class FakeMail:
     def __init__(self, fail=False):
         self.fail = fail
@@ -294,4 +304,43 @@ def test_list_mailboxes_sorts_by_created_time(tmp_path):
     assert newest == ["new@icloud.com", "mid@icloud.com", "old@icloud.com"]
     assert oldest == ["old@icloud.com", "mid@icloud.com", "new@icloud.com"]
     assert by_alias == ["mid@icloud.com", "new@icloud.com", "old@icloud.com"]
+
+def test_list_mailboxes_exposes_cached_latest_subject(tmp_path):
+    svc = MailboxService(
+        FakeManager(),
+        latest_emails_path=latest_file(tmp_path),
+        index_path=tmp_path / "idx_subject.json",
+    )
+    items = {item["alias_email"]: item for item in svc.list_mailboxes()}
+    assert items["alias@icloud.com"]["latest_subject"] == ""
+
+    svc.account_mgr._cache = CachedMessageCache()
+    items = {item["alias_email"]: item for item in svc.list_mailboxes()}
+    assert items["alias@icloud.com"]["latest_subject"] == "New"
+
+
+
+def test_list_mailboxes_derives_provider_flags_and_filters_from_cache(tmp_path):
+    manager = FakeManager()
+    manager._cache = ProviderMessageCache()
+    svc = MailboxService(manager, latest_emails_path=latest_file(tmp_path), index_path=tmp_path / "idx_provider.json")
+
+    items = {item["alias_email"]: item for item in svc.list_mailboxes()}
+    assert items["alias@icloud.com"]["has_claude"] is True
+    assert items["alias@icloud.com"]["has_openai"] is True
+    assert items["alias@icloud.com"]["is_empty"] is False
+    assert items["local@icloud.com"]["is_empty"] is True
+    assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="claude")] == ["alias@icloud.com"]
+    assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="openai")] == ["alias@icloud.com"]
+    assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="empty")] == ["local@icloud.com"]
+def test_delete_mailbox_cleans_local_record_without_remote_id(tmp_path):
+    latest = latest_file(tmp_path)
+    svc = MailboxService(FakeManager(), latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    result = svc.delete_mailbox("alias@icloud.com")
+
+    assert result["remote_deleted"] is False
+    assert "缺少 Apple 别名标识" in result["warning"]
+    assert "alias@icloud.com" not in latest.read_text(encoding="utf-8")
+    assert [item["alias_email"] for item in svc.list_mailboxes()] == ["local@icloud.com"]
 

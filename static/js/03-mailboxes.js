@@ -40,6 +40,12 @@
     if (!Number.isNaN(parsed)) return formatCreatedAt(parsed);
     return String(value);
   }
+  function providerBadges(mailbox){
+    const badges = [];
+    if (mailbox.has_claude) badges.push('<span class="badge provider claude" title="缓存邮件命中 Claude">Claude</span>');
+    if (mailbox.has_openai) badges.push('<span class="badge provider openai" title="缓存邮件命中 OpenAI">OpenAI</span>');
+    return badges.length ? badges.join(' ') + ' ' : '';
+  }
 
 
   function mailboxRows(items){
@@ -47,13 +53,18 @@
       const aliasArg = S.inlineArg(m.alias_email);
       const routeArg = S.inlineArg('#/mailbox/' + encodeURIComponent(m.alias_email));
       const groupArg = S.inlineArg(m.group_id || 'grp_default');
-      return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + S.esc(m.label || '') + '</td><td class="mono">' + S.esc(formatCreatedAt(m.created_at)) + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(' + aliasArg + ');HME.toast(\'已复制\')">复制</button> <button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">兑换码</button></td></tr>';
+      const subject = String(m.latest_subject || '').trim();
+      const latest = providerBadges(m) + (subject ? S.esc(subject) : '<span class="muted">空</span>');
+      const shareAction = m.shared
+        ? '<button class="btn btn-outline btn-sm" onclick="HME.revokeShare(' + S.inlineArg(m.shared.id) + ',' + aliasArg + ')">吊销共享</button>'
+        : '<button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">共享</button>';
+      return '<tr><td>' + (i + 1) + '</td><td><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + latest + '</td><td class="mono">' + S.esc(formatCreatedAt(m.created_at)) + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> ' + shareAction + ' <button class="btn btn-danger btn-sm" onclick="HME.deleteMailbox(' + aliasArg + ')">删除</button></td></tr>';
     }).join('');
   }
 
   function mailboxTable(items){
     if (!items || !items.length) return S.empty('暂无邮箱 - 去仪表盘或批量创建生成', '<button class="btn btn-sm" onclick="HME.navigate(\'#/batch\')">去批量创建</button>');
-    return '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>标签</th><th>创建时间</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + mailboxRows(items) + '</tbody></table></div>';
+    return '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>最新邮件</th><th>创建时间</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + mailboxRows(items) + '</tbody></table></div>';
   }
 
   function mailboxSource(data){
@@ -63,13 +74,24 @@
     return '<span class="muted mono">' + S.esc(source + synced) + '</span>';
   }
 
-  function filterHtml(q, account, group, status, sort, refresh){
+  function mailProbeHtml(data){
+    const config = (data && data.config) || {};
+    const state = (data && data.state) || {};
+    const enabled = config.enabled === true;
+    const running = state.running === true;
+    const next = state.next_trigger ? new Date(state.next_trigger * 1000).toLocaleString() : '等待每日启动时间';
+    const status = running ? '运行中' : (enabled ? '已启用' : '未启用');
+    return '<div class="panel probe-panel"><div class="panel-head"><span>自动探测邮件</span><span class="muted mono">' + S.esc(status) + (state.last_run ? ' · 上次 ' + S.esc(state.last_run) : '') + '</span></div><div class="filter-row"><label><input id="mailProbeEnabled" type="checkbox"' + (enabled ? ' checked' : '') + '> 启用</label><label>间隔 <input id="mailProbeInterval" type="number" min="1" max="1440" value="' + S.esc(config.interval_minutes || 30) + '" style="width:90px"> 分钟</label><label>每日启动 <input id="mailProbeStart" type="time" value="' + S.esc(config.start_time || '08:00') + '"></label><button class="btn btn-sm" onclick="HME.saveMailProbeConfig()">保存设置</button><button class="btn btn-outline btn-sm" onclick="HME.runMailProbeNow()">立即探测</button><span class="muted mono">下次：' + S.esc(next) + '</span></div></div>';
+  }
+
+  function filterHtml(q, account, group, status, mailKind, sort, refresh){
     const accountOptions = ['<option value="">全部账号</option>'].concat(S.accounts.map(a => '<option value="' + S.esc(a.id) + '"' + (a.id === account ? ' selected' : '') + '>' + S.esc(a.name || a.id) + '</option>')).join('');
     const groupOptionsHtml = groupOptions(group, '全部分组');
     const syncLabel = refresh ? '同步中...' : '云端同步';
     const sortValue = sort || 'created_at';
     const sortHtml = '<select id="mailboxSort"><option value="created_at"' + (sortValue === 'created_at' ? ' selected' : '') + '>时间新→旧</option><option value="created_at_asc"' + (sortValue === 'created_at_asc' ? ' selected' : '') + '>时间旧→新</option><option value="alias"' + (sortValue === 'alias' ? ' selected' : '') + '>邮箱地址</option></select>';
-    return '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxGroup">' + groupOptionsHtml + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select>' + sortHtml + '<button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
+    const kindHtml = '<select id="mailboxKind"><option value=""' + (!mailKind ? ' selected' : '') + '>全部邮件属性</option><option value="claude"' + (mailKind === 'claude' ? ' selected' : '') + '>Claude</option><option value="openai"' + (mailKind === 'openai' ? ' selected' : '') + '>OpenAI</option><option value="empty"' + (mailKind === 'empty' ? ' selected' : '') + '>空邮箱</option></select>';
+    return '<div class="filter-row"><input id="mailboxQ" style="min-width:280px" placeholder="搜索邮箱、标签、账号" value="' + S.esc(q) + '"><select id="mailboxAccount">' + accountOptions + '</select><select id="mailboxGroup">' + groupOptionsHtml + '</select><select id="mailboxStatus"><option value="">全部状态</option><option value="active"' + (status === 'active' ? ' selected' : '') + '>活跃</option><option value="inactive"' + (status === 'inactive' ? ' selected' : '') + '>停用</option></select>' + kindHtml + sortHtml + '<button class="btn btn-outline btn-sm" onclick="HME.renderMailboxes(true)">' + syncLabel + '</button><button class="btn btn-outline btn-sm" onclick="HME.copyMailboxes()">复制全部</button><button class="btn btn-outline btn-sm" onclick="HME.exportMailboxes()">CSV</button></div>';
   }
 
   S.renderMailboxes = async function(refresh){
@@ -79,15 +101,17 @@
     const account = p.get('account') || '';
     const group = p.get('group_id') || p.get('group') || '';
     const status = p.get('status') || '';
+    const mailKind = p.get('mail_kind') || '';
     const sort = p.get('sort') || 'created_at';
     const current = S.mailboxes && S.mailboxes.length ? mailboxTable(S.mailboxes) : S.empty('读取本地邮箱列表...');
-    S.view('<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(null) + '</span></div>' + filterHtml(q, account, group, status, sort, refresh) + '<div id="mailboxListBody">' + current + '</div></div>');
+    S.view(mailProbeHtml(null) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(null) + '</span></div>' + filterHtml(q, account, group, status, mailKind, sort, refresh) + '<div id="mailboxListBody">' + current + '</div></div>');
     bindFilters();
     try {
-      const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&group_id=' + encodeURIComponent(group) + '&status=' + encodeURIComponent(status) + '&sort=' + encodeURIComponent(sort) + '&limit=200' + (refresh ? '&refresh=1' : '');
+      const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&group_id=' + encodeURIComponent(group) + '&status=' + encodeURIComponent(status) + '&mail_kind=' + encodeURIComponent(mailKind) + '&sort=' + encodeURIComponent(sort) + '&limit=200' + (refresh ? '&refresh=1' : '');
       const data = await S.api('/api/mailboxes?' + query);
+      const probe = data.mail_probe || {config:{enabled:false,interval_minutes:30,start_time:'08:00'},state:{}};
       S.mailboxes = data.mailboxes || [];
-      const finalHtml = '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(data) + ' · ' + (data.total || 0) + ' total</span></div>' + filterHtml(q, account, group, status, sort, false) + '<div id="mailboxListBody">' + mailboxTable(S.mailboxes) + '</div></div>';
+      const finalHtml = mailProbeHtml(probe) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(data) + ' · ' + (data.total || 0) + ' total</span></div>' + filterHtml(q, account, group, status, mailKind, sort, false) + '<div id="mailboxListBody">' + mailboxTable(S.mailboxes) + '</div></div>';
       S.view(finalHtml);
       bindFilters();
     } catch (err) {
@@ -102,11 +126,13 @@
     const account = S.E('mailboxAccount');
     const group = S.E('mailboxGroup');
     const status = S.E('mailboxStatus');
+    const mailKind = S.E('mailboxKind');
     const sort = S.E('mailboxSort');
     if (q) q.addEventListener('input', () => S.debounce('mailboxSearch', applyFilters, 300));
     if (account) account.addEventListener('change', applyFilters);
     if (group) group.addEventListener('change', applyFilters);
     if (status) status.addEventListener('change', applyFilters);
+    if (mailKind) mailKind.addEventListener('change', applyFilters);
     if (sort) sort.addEventListener('change', applyFilters);
   }
 
@@ -116,15 +142,16 @@
     const account = S.E('mailboxAccount')?.value;
     const group = S.E('mailboxGroup')?.value;
     const status = S.E('mailboxStatus')?.value;
+    const mailKind = S.E('mailboxKind')?.value;
     const sort = S.E('mailboxSort')?.value;
     if (q) qp.set('q', q);
     if (account) qp.set('account', account);
     if (group) qp.set('group_id', group);
     if (status) qp.set('status', status);
+    if (mailKind) qp.set('mail_kind', mailKind);
     if (sort && sort !== 'created_at') qp.set('sort', sort);
     S.navigate('#/mailboxes' + (qp.toString() ? '?' + qp.toString() : ''));
   }
-
   function latestMailHtml(alias, msg, mailError){
     if (mailError) return S.empty(mailError);
     if (!msg) return S.empty('暂无邮件');
@@ -169,6 +196,40 @@
       if (force) S.toast(text, true);
       return html;
     }
+  };
+
+  S.saveMailProbeConfig = async function(){
+    const payload = {
+      enabled: Boolean(S.E('mailProbeEnabled')?.checked),
+      interval_minutes: Number(S.E('mailProbeInterval')?.value || 30),
+      start_time: S.E('mailProbeStart')?.value || '08:00',
+    };
+    if (!Number.isInteger(payload.interval_minutes) || payload.interval_minutes < 1 || payload.interval_minutes > 1440) {
+      S.toast('探测间隔必须是 1-1440 分钟', true);
+      return;
+    }
+    try {
+      await S.api('/api/mail-probe/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      S.toast(payload.enabled ? '自动探测已启用' : '自动探测已停用');
+      await S.renderMailboxes(false);
+    } catch (err) { S.toast(err.message, true); }
+  };
+
+  S.runMailProbeNow = async function(){
+    try {
+      await S.api('/api/mailboxes/probe', {method:'POST'});
+      S.toast('邮件探测已加入后台队列');
+    } catch (err) { S.toast(err.message, true); }
+  };
+
+  S.deleteMailbox = async function(alias){
+    if (!confirm('确认删除邮箱 ' + alias + '？此操作会删除 Apple 别名及本地记录。')) return;
+    try {
+      const data = await S.api('/api/mailboxes/' + encodeURIComponent(alias), {method:'DELETE'});
+      const warning = data.mailbox && data.mailbox.warning;
+      S.toast(warning || '邮箱已删除', Boolean(warning));
+      await S.refreshAll();
+    } catch (err) { S.toast(err.message, true); }
   };
 
   S.showMailboxGroupModal = function(alias, selectedGroup){

@@ -6,8 +6,10 @@
 
   S.renderBatch = function(){
     S.setTitle('批量创建');
-    const checks = S.accounts.map(a => '<label><input type="checkbox" name="batchAcc" value="' + S.esc(a.id) + '"' + (a.status === 'active' ? '' : ' disabled') + '> ' + S.esc(a.name || a.id) + (a.status === 'active' ? '' : ' <span class="badge err">' + S.esc(a.status || '不可用') + '</span>') + '</label>').join('<br>');
-    S.view('<div class="panel"><div class="panel-head">批量创建</div><div class="panel-body">' + (checks || S.empty('暂无账号')) + '<div style="height:14px"></div><input id="batchCount" type="number" min="1" max="20" value="1"> <input id="batchLabel" placeholder="标签，可选"> <button id="batchRun" class="btn" onclick="HME.runBatch()">开始创建</button><div id="batchResult" class="muted mono" style="margin-top:14px"></div></div></div><div class="panel"><div class="panel-head"><span>运行日志</span><span class="muted mono" id="batchProgress"></span></div><div class="panel-body mono" id="batchFeed" style="max-height:340px;overflow:auto">' + S.empty('开始创建后在此实时显示') + '</div></div>');
+    const checks = S.accounts.map(a => '<label><input type="checkbox" name="batchAcc" value="' + S.esc(a.id) + '"' + (a.status === 'active' ? ' checked' : ' disabled') + '> ' + S.esc(a.name || a.id) + (a.status === 'active' ? '' : ' <span class="badge err">' + S.esc(a.status || '不可用') + '</span>') + '</label>').join('<br>');
+    S.view('<div class="panel"><div class="panel-head">批量创建</div><div class="panel-body"><form id="batchForm">' + (checks || S.empty('暂无账号')) + '<div style="height:14px"></div><input id="batchCount" type="number" min="1" max="20" value="1"> <input id="batchLabel" placeholder="标签，可选"> <button id="batchRun" type="submit" class="btn">开始创建</button><div id="batchResult" class="muted mono" style="margin-top:14px"></div></form></div></div><div class="panel"><div class="panel-head"><span>运行日志</span><span class="muted mono" id="batchProgress"></span></div><div class="panel-body mono" id="batchFeed" style="max-height:340px;overflow:auto">' + S.empty('开始创建后在此实时显示') + '</div></div>');
+    const form = S.E('batchForm');
+    if (form) form.addEventListener('submit', event => { event.preventDefault(); S.runBatch(); });
   };
 
   function batchAppend(entry){

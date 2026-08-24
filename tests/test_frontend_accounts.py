@@ -22,7 +22,7 @@ const fs = require('fs');
 const vm = require('vm');
 let rendered = '';
 const S = {
-  accounts: [{id:'acc_1', name:'Main', real_email:'main@example.com', status:'active', alias_total:2, alias_active:1}],
+  accounts: [{id:'acc_1', name:'Main', real_email:'main@example.com', status:'active', alias_total:2, alias_active:1, has_claude:true, has_openai:true}],
   state: {account_count:1, active_accounts:1, total_aliases:2, today_created:0},
   E(){ return null; },
   esc(value){ return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); },
@@ -39,6 +39,7 @@ vm.runInNewContext(fs.readFileSync('static/js/02-accounts.js', 'utf8'), context)
   const editMarker = 'onclick="HME.showEditAccountModal(&quot;acc_1&quot;)"';
   if (!rendered.includes(editMarker)) throw new Error('edit account button missing: ' + rendered);
   if (!rendered.includes('btn-danger') || !rendered.includes('>删除</button>')) throw new Error('delete button style/text missing: ' + rendered);
+  if (!rendered.includes('>Claude</span>') || !rendered.includes('>OpenAI</span>')) throw new Error('provider badges missing: ' + rendered);
 })().catch(err => { console.error(err.stack || err.message); process.exit(1); });
 '''
     run_node(script)

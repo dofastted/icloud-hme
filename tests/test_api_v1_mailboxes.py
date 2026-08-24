@@ -69,6 +69,22 @@ class NoMailConfigManager(FakeManager):
         raise ValueError("未设置 App 专用密码。 请点击下方按钮，输入 @icloud.com 邮箱和应用密码")
 
 
+class DeletableManager(FakeManager):
+    def __init__(self):
+        super().__init__()
+        self.deleted = []
+
+    def get_all_aliases(self):
+        return [{"hme": "alias@icloud.com", "account_id": "acc_1", "account_name": "Main", "label": "Login", "isActive": True, "anonymousId": "anon-1"}]
+
+    def delete_alias_for_account(self, acc_id, anonymous_id):
+        self.deleted.append((acc_id, anonymous_id))
+        return True
+
+    def move_mailboxes_to_group(self, alias_emails, group_id):
+        return len(alias_emails)
+
+
 def configure_manager(monkeypatch, tmp_path, manager):
     store = SharedMailboxStore(tmp_path / "shared.json")
     api_keys = APIKeyStore(tmp_path / "api_keys.json")
@@ -255,6 +271,20 @@ def test_v1_mailboxes_messages_and_shared_flow(monkeypatch, tmp_path):
     revoked = client.post(f"/api/v1/shared-mailboxes/{share_id}/revoke", headers=headers)
     assert revoked.status_code == 200
     assert revoked.json["ok"] is True
+def test_v1_delete_mailbox_deletes_remote_alias_and_local_records(monkeypatch, tmp_path):
+    manager = DeletableManager()
+    client, key, _store = configure_manager(monkeypatch, tmp_path, manager)
+    headers = {"X-API-Key": key}
+
+    synced = client.get("/api/v1/mailboxes?refresh=1", headers=headers)
+    assert synced.status_code == 200
+    deleted = client.delete("/api/v1/mailboxes/alias@icloud.com", headers=headers)
+
+    assert deleted.status_code == 200
+    assert deleted.json["mailbox"]["remote_deleted"] is True
+    assert manager.deleted == [("acc_1", "anon-1")]
+    assert client.get("/api/v1/mailboxes", headers=headers).json["total"] == 0
+
 
 
 def test_shared_entry_url_uses_configured_public_domain(monkeypatch, tmp_path):

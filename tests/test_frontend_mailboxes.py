@@ -45,6 +45,7 @@ const S = {
   debounce(){},
   toast(){},
   async api(path){
+    if (path === '/api/mail-probe/config') return {ok:true,config:{enabled:false,interval_minutes:30,start_time:'08:00'},state:{}};
     requestedPath = path;
     if (!path.startsWith('/api/mailboxes?')) throw new Error('unexpected api ' + path);
     return {
@@ -148,5 +149,42 @@ vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context
     throw new Error('sort was not kept in hash: ' + navigated);
   }
 })().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    run_node(script)
+
+def test_mailbox_list_renders_latest_subject_and_delete_action():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+const S = {
+  accounts: [], groups: [], mailboxes: [],
+  E(){ return null; },
+  esc(value){ return String(value == null ? '' : value); },
+  inlineArg(value){ return JSON.stringify(value); },
+  setTitle(){}, loading(){ return ''; }, empty(text){ return text; }, error(err){ return String(err); },
+  view(html){ rendered = html; }, debounce(){},
+  async api(path){
+    if (path.indexOf('/api/mailboxes?') === 0) return {ok:true,total:1,mailboxes:[{alias_email:'a@icloud.com', account_name:'Main', group_id:'grp_default', group_name:'可用', latest_subject:'登录提醒', is_active:true}]};
+    return {ok:true,config:{enabled:false,interval_minutes:30,start_time:'08:00'},state:{}};
+  }
+};
+const context = {window:{HME:S}, location:{hash:'#/mailboxes'}, URLSearchParams, encodeURIComponent, console};
+vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context);
+(async () => {
+  await S.renderMailboxes(false);
+  if (!rendered.includes('最新邮件') || !rendered.includes('登录提醒')) throw new Error('latest subject missing');
+  if (rendered.includes('<th>标签</th>')) throw new Error('label column remains');
+  if (!rendered.includes('HME.deleteMailbox')) throw new Error('delete action missing');
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+
+def test_mailbox_list_renders_provider_badges_and_kind_filter():
+    script = r'''
+const fs = require('fs'); const vm = require('vm'); let rendered = ''; let requested = '';
+const elements = {mailboxQ:{value:'',addEventListener(){}},mailboxAccount:{value:'',addEventListener(){}},mailboxGroup:{value:'',addEventListener(){}},mailboxStatus:{value:'',addEventListener(){}},mailboxKind:{value:'claude',addEventListener(){}},mailboxSort:{value:'created_at',addEventListener(){}}};
+const S = {accounts:[],groups:[],mailboxes:[],E(id){return elements[id]||null},esc(v){return String(v??'')},inlineArg(v){return JSON.stringify(v)},setTitle(){},empty(v){return v},view(h){rendered=h},debounce(){},async api(path){requested=path;return {ok:true,total:1,mailboxes:[{alias_email:'a@icloud.com',account_name:'Main',group_name:'可用',latest_subject:'Hello',has_claude:true,has_openai:true,is_active:true}]}}};
+const context={window:{HME:S},location:{hash:'#/mailboxes?mail_kind=claude'},URLSearchParams,encodeURIComponent,console}; vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js','utf8'),context);
+(async()=>{await S.renderMailboxes(false); if(!requested.includes('mail_kind=claude'))throw Error('kind query missing: '+requested); if(!rendered.includes('Claude')||!rendered.includes('OpenAI'))throw Error('provider badges missing: '+rendered); if(!rendered.includes('空邮箱'))throw Error('empty filter missing');})().catch(e=>{console.error(e.stack);process.exit(1)});
 '''
     run_node(script)

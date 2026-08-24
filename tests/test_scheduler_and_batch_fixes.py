@@ -1,5 +1,9 @@
 import json
 import sys
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 import types
 
 import account_manager
@@ -44,8 +48,8 @@ def test_update_session_allowed_when_duplicate_is_error(monkeypatch, tmp_path):
     assert updated["cookies"] == {"C": "3"}
 
 
-def test_health_loop_also_revalidates_error_accounts(monkeypatch):
-    """error 账号必须能被健康检查复查，否则一次网络抖动就永久失活。"""
+def test_health_loop_skips_error_accounts(monkeypatch):
+    """健康检查只探测 active 账号，不触碰已标记 error 的账号。"""
     queued = []
 
     class OneShotEvent:
@@ -74,7 +78,7 @@ def test_health_loop_also_revalidates_error_accounts(monkeypatch):
 
     web_ui._health_loop()
 
-    assert [acc for acc, _ in queued] == ["a1", "a2"]
+    assert [acc for acc, _ in queued] == ["a1"]
 
 
 def test_health_loop_uses_its_own_stop_event(monkeypatch):
@@ -176,6 +180,46 @@ def _sse_events(response):
         if line:
             events.append(json.loads(line[5:].strip()))
     return events
+
+def test_batch_form_selects_active_accounts_and_submits():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+let submitHandler = null;
+let runCalls = 0;
+const form = {addEventListener(type, handler) { if (type === 'submit') submitHandler = handler; }};
+const S = {
+  accounts: [
+    {id:'active-1', name:'Active', status:'active'},
+    {id:'error-1', name:'Error', status:'error'},
+  ],
+  E(id) { return id === 'batchForm' ? form : null; },
+  esc(value) { return String(value == null ? '' : value); },
+  empty(value) { return value; },
+  setTitle() {},
+  view(html) { rendered = html; },
+};
+const context = {window:{HME:S}, document:{querySelectorAll(){ return []; }}, fetch, TextDecoder, console};
+vm.runInNewContext(fs.readFileSync('static/js/05-inbox-docs.js', 'utf8'), context);
+S.runBatch = async () => { runCalls += 1; };
+S.renderBatch();
+if (!rendered.includes('value="active-1" checked')) throw new Error('active account not selected by default');
+if (!rendered.includes('value="error-1" disabled')) throw new Error('error account should stay disabled');
+if (!submitHandler) throw new Error('batch form submit handler missing');
+let prevented = false;
+submitHandler({preventDefault(){ prevented = true; }});
+if (!prevented || runCalls !== 1) throw new Error('batch submit did not execute exactly once');
+''';
+    result = subprocess.run(
+        ["node", "-e", script],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_batch_create_reports_failure_not_success(monkeypatch):
@@ -289,3 +333,43 @@ def test_create_aliases_sleeps_between_attempts(monkeypatch, tmp_path):
     mgr.create_aliases_for_account(account["id"], count=3)
 
     assert sleeps == [20.0, 20.0], "3 次创建之间应有 2 段间隔"
+
+def test_mail_probe_config_validates_and_persists(monkeypatch, tmp_path):
+    config_file = tmp_path / "mail_probe_config.json"
+    monkeypatch.setattr(web_ui, "MAIL_PROBE_CONFIG_FILE", config_file)
+    started = []
+    stopped = []
+    monkeypatch.setattr(web_ui, "_start_mail_probe_thread", lambda: started.append(True) or True)
+    monkeypatch.setattr(web_ui, "_stop_mail_probe_thread", lambda: stopped.append(True))
+    client = web_ui.app.test_client()
+
+    saved = client.put(
+        "/api/mail-probe/config",
+        json={"enabled": True, "interval_minutes": 45, "start_time": "09:30"},
+    )
+    assert saved.status_code == 200
+    assert saved.json["config"] == {"enabled": True, "interval_minutes": 45, "start_time": "09:30"}
+    assert started == [True]
+    assert json.loads(config_file.read_text(encoding="utf-8"))["interval_minutes"] == 45
+
+    invalid = client.put(
+        "/api/mail-probe/config",
+        json={"enabled": True, "interval_minutes": 45, "start_time": "25:00"},
+    )
+    assert invalid.status_code == 400
+
+    disabled = client.put(
+        "/api/mail-probe/config",
+        json={"enabled": False, "interval_minutes": 45, "start_time": "09:30"},
+    )
+    assert disabled.status_code == 200
+    assert stopped == [True]
+
+def test_mail_probe_run_uses_mailbox_compatibility_path(monkeypatch):
+    monkeypatch.setattr(web_ui, "_run_mail_probe_once", lambda: True)
+    client = web_ui.app.test_client()
+
+    response = client.post("/api/mailboxes/probe")
+
+    assert response.status_code == 200
+    assert response.json == {"ok": True, "queued": True}

@@ -18,7 +18,7 @@ added to ``SharedPublicView``.
 """
 
 import json
-from email.utils import getaddresses
+from email.utils import getaddresses, parsedate_to_datetime
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -56,8 +56,23 @@ class IMAPUnavailable(RuntimeError):
     """The mail backend failed while reading messages."""
 
 
+def normalize_mail_filter(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in {"claude", "openai", "empty"} else ""
+
+
+def _message_provider_flags(message: Optional[Dict]) -> Dict[str, bool]:
+    if not message:
+        return {"claude": False, "openai": False}
+    text = " ".join(
+        str(message.get(key) or "")
+        for key in ("subject", "from", "to", "body_preview", "body", "text")
+    ).lower()
+    return {"claude": "claude" in text, "openai": "openai" in text}
+
+
 class MailboxService:
-    """Read-only service for HME mailbox lookup and IMAP mail access."""
+    """Mailbox lookup, cached mail access, and mailbox deletion service."""
 
     def __init__(
         self,
@@ -79,6 +94,7 @@ class MailboxService:
         status: str = "",
         refresh: bool = False,
         sort: str = "",
+        mail_kind: str = "",
     ) -> List[Dict]:
         accounts = {a.get("id"): a for a in self.account_mgr.list_accounts()}
         by_alias: Dict[str, Dict] = {}
@@ -102,6 +118,18 @@ class MailboxService:
                 if self.shared_store
                 else None
             )
+            cached = self._cached_alias_messages(
+                item.get("account_id", ""), item["alias_email"], allow_stale=True
+            )
+            item["is_empty"] = not cached
+            flags = {"claude": False, "openai": False}
+            for message in cached:
+                message_flags = _message_provider_flags(message)
+                flags["claude"] |= message_flags["claude"]
+                flags["openai"] |= message_flags["openai"]
+            item["has_claude"] = flags["claude"]
+            item["has_openai"] = flags["openai"]
+            item["latest_subject"] = str(cached[0].get("subject") or "") if cached else ""
 
         needle = q.strip().lower()
         if needle:
@@ -110,20 +138,43 @@ class MailboxService:
                 if needle in item["alias_email"].lower()
                 or needle in str(item.get("label") or "").lower()
                 or needle in str(item.get("account_name") or "").lower()
+                or needle in str(item.get("latest_subject") or "").lower()
             ]
         if account_id:
             items = [item for item in items if item.get("account_id") == account_id]
         if group_id:
             items = [item for item in items if item.get("group_id") == group_id]
+
         if status:
             normalized = status.lower()
             if normalized in ("active", "enabled"):
                 items = [item for item in items if item.get("is_active") is True]
             elif normalized in ("inactive", "disabled", "revoked"):
                 items = [item for item in items if item.get("is_active") is False]
+        normalized_kind = normalize_mail_filter(mail_kind)
+        if normalized_kind:
+            if normalized_kind == "empty":
+                items = [item for item in items if item["is_empty"]]
+            else:
+                items = [item for item in items if item[f"has_{normalized_kind}"]]
 
         sort_mode = normalize_mailbox_sort(sort)
         return sorted(items, key=lambda item: _mailbox_sort_key(item, sort_mode))
+    def account_mail_attributes(self) -> Dict[str, Dict[str, bool]]:
+        attributes = {
+            str(account.get("id") or ""): {"has_claude": False, "has_openai": False}
+            for account in self.account_mgr.list_accounts()
+            if account.get("id")
+        }
+        for mailbox in self.list_mailboxes():
+            account = attributes.get(str(mailbox.get("account_id") or ""))
+            if not account:
+                continue
+            account["has_claude"] |= bool(mailbox.get("has_claude"))
+            account["has_openai"] |= bool(mailbox.get("has_openai"))
+        return attributes
+
+
 
     def refresh_mailboxes(self) -> List[Dict]:
         return self.list_mailboxes(refresh=True)
@@ -176,6 +227,72 @@ class MailboxService:
     def get_message_detail(self, alias_email: str, message_id: str) -> Dict:
         account, _meta = self.resolve_alias(alias_email)
         return self._get_message_detail_for_account(account, alias_email, message_id)
+    def delete_mailbox(self, alias_email: str) -> Dict:
+        account, mailbox = self.resolve_alias(alias_email)
+        alias = mailbox["alias_email"]
+        anonymous_id = str(mailbox.get("anonymous_id") or "").strip()
+        remote_deleted = False
+        if anonymous_id:
+            ok = self.account_mgr.delete_alias_for_account(account["id"], anonymous_id)
+            if not ok:
+                raise RuntimeError("Apple 别名删除失败")
+            remote_deleted = True
+
+        local_removed = self._purge_local_mailbox(alias, account["id"])
+        shared_revoked = False
+        shared = self.shared_store.get_for_alias(alias) if self.shared_store else None
+        if shared and self.shared_store:
+            shared_revoked = self.shared_store.revoke(shared["id"])
+        return {
+            "alias_email": alias,
+            "remote_deleted": remote_deleted,
+            "local_removed": local_removed,
+            "shared_revoked": shared_revoked,
+            "warning": "缺少 Apple 别名标识，仅清理本地记录" if not anonymous_id else "",
+        }
+
+    def _purge_local_mailbox(self, alias: str, account_id: str) -> List[str]:
+        touched: List[str] = []
+        if self.index_path.exists():
+            try:
+                data = json.loads(self.index_path.read_text(encoding="utf-8"))
+                mailboxes = data.get("mailboxes") if isinstance(data, dict) else None
+                if isinstance(mailboxes, dict) and alias in mailboxes:
+                    del mailboxes[alias]
+                    data["updated_at"] = datetime.now().isoformat()
+                    self.index_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    touched.append("index")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if self.latest_emails_path.exists():
+            try:
+                lines = self.latest_emails_path.read_text(encoding="utf-8").splitlines()
+                kept = [line for line in lines if not line.strip().split("\t", 1)[0].strip().lower() == alias]
+                if len(kept) != len(lines):
+                    text = "\n".join(kept)
+                    self.latest_emails_path.write_text(text + ("\n" if text else ""), encoding="utf-8")
+                    touched.append("latest_emails")
+            except OSError:
+                pass
+
+        move = getattr(self.account_mgr, "move_mailboxes_to_group", None)
+        if callable(move):
+            try:
+                if move([alias], DEFAULT_GROUP_ID):
+                    touched.append("group")
+            except Exception:
+                pass
+
+        cache = getattr(self.account_mgr, "_cache", None)
+        clear_alias = getattr(cache, "clear_alias", None)
+        if callable(clear_alias):
+            try:
+                if clear_alias(account_id, alias):
+                    touched.append("mail_cache")
+            except Exception:
+                pass
+        return touched
 
     def shared_public_view(self, share: Dict, force: bool = False) -> Dict:
         alias = _normalize_alias(share.get("alias_email", ""))
@@ -396,6 +513,7 @@ class MailboxService:
             "account_id": source.get("account_id") or account.get("id", ""),
             "account_name": source.get("account_name") or account.get("name", ""),
             "label": source.get("label", ""),
+            "anonymous_id": source.get("anonymousId") or source.get("anonymous_id") or source.get("id") or "",
             "forward_to_email": source.get("forwardToEmail") or source.get("forward_to_email") or "",
             **group_fields,
             "is_active": bool(is_active),
@@ -405,7 +523,7 @@ class MailboxService:
             "shared": None,
         }
 
-    def _cached_alias_messages(self, account_id: str, alias: str) -> List[Dict]:
+    def _cached_alias_messages(self, account_id: str, alias: str, allow_stale: bool = False) -> List[Dict]:
         cache = getattr(self.account_mgr, "_cache", None)
         if not cache:
             return []
@@ -414,9 +532,9 @@ class MailboxService:
             cached = cache.get_alias_mail(account_id, alias)
         except Exception:
             return []
-        if cached and age < MAIL_CACHE_TTL_SECONDS:
-            return list(cached)
-        return []
+        if not cached or (not allow_stale and age >= MAIL_CACHE_TTL_SECONDS):
+            return []
+        return sorted(cached, key=self._message_sort_key, reverse=True)
 
     def _store_alias_messages(self, account_id: str, alias: str, messages: List[Dict]):
         cache = getattr(self.account_mgr, "_cache", None)
@@ -426,6 +544,18 @@ class MailboxService:
             cache.set_alias_mail(account_id, alias, messages)
         except Exception:
             pass
+
+    @staticmethod
+    def _message_sort_key(message: Dict):
+        value = str(message.get("date") or "")
+        try:
+            return (1, parsedate_to_datetime(value).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            return (0, value)
+
+    def _latest_cached_subject(self, account_id: str, alias: str) -> str:
+        cached = self._cached_alias_messages(account_id, alias, allow_stale=True)
+        return str(cached[0].get("subject") or "") if cached else ""
 
     def _cache_age(self, account_id: str):
         cache = getattr(self.account_mgr, "_cache", None)

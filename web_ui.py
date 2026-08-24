@@ -22,9 +22,11 @@ from shared_mailboxes import SharedMailboxStore
 DATA_DIR = Path(os.environ.get("HME_DATA_DIR", str(HERE)))
 RESULTS_DIR = DATA_DIR / "results"
 LOGS_DIR = DATA_DIR / "logs"
+MAIL_PROBE_CONFIG_FILE = DATA_DIR / "mail_probe_config.json"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 SCHEDULER_WINDOW_START_HOUR = 7
 SCHEDULER_WINDOW_END_HOUR = 20
+DEFAULT_MAIL_PROBE_CONFIG = {"enabled": False, "interval_minutes": 30, "start_time": "08:00"}
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -35,7 +37,7 @@ _log_queue = queue.Queue()
 _log_buffer = deque(maxlen=500)
 _log_lock = threading.Lock()
 _today_key = datetime.now().strftime("%Y%m%d")
-_global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
+_global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0,"mail_probe_running":False,"mail_probe_next_trigger":None,"mail_probe_last_run":None,"mail_probe_last_error":None}
 _lock = threading.Lock()
 _validation_queue = queue.Queue()
 _validation_thread = None
@@ -44,6 +46,10 @@ _validation_jobs = {}
 _scheduler_thread = None
 _stop_event = threading.Event()
 _health_stop_event = threading.Event()
+_mail_probe_thread = None
+_mail_probe_stop_event = threading.Event()
+_mail_probe_wake_event = threading.Event()
+_mail_probe_run_lock = threading.Lock()
 _account_mgr = AccountManager()
 _api_keys = APIKeyStore()
 _shared_store = SharedMailboxStore()
@@ -92,7 +98,7 @@ def _require_api_key(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-def _safe_account(account):
+def _safe_account(account, mail_attributes=None):
     safe = {k:v for k,v in account.items() if k not in ("cookies","app_password","icloud_email","mail_password","group_id","group_name","group_color","session_fingerprint")}
     get_settings = getattr(_account_mgr, "get_account_mail_settings", None)
     if callable(get_settings):
@@ -105,7 +111,14 @@ def _safe_account(account):
         safe["mail_port"] = int(account.get("mail_port") or 993)
         safe["imap_config_id"] = ""
         safe["imap_config_name"] = ""
+    derived = (mail_attributes or {}).get(str(account.get("id") or ""), {})
+    safe["has_claude"] = bool(derived.get("has_claude"))
+    safe["has_openai"] = bool(derived.get("has_openai"))
     return safe
+
+
+def _account_mail_attributes():
+    return _mailbox_service.account_mail_attributes()
 
 def _list_imap_configs_safe():
     list_configs = getattr(_account_mgr, "list_imap_configs", None)
@@ -324,6 +337,128 @@ def _now() -> datetime: return datetime.now() + timedelta(seconds=_time_offset)
 
 def _beijing_now() -> datetime:
     return (datetime.now(timezone.utc) + timedelta(seconds=_time_offset)).astimezone(BEIJING_TZ)
+
+def _mail_probe_config() -> dict:
+    config = dict(DEFAULT_MAIL_PROBE_CONFIG)
+    try:
+        data = json.loads(MAIL_PROBE_CONFIG_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            config.update(data)
+    except (OSError, json.JSONDecodeError):
+        pass
+    config["enabled"] = bool(config.get("enabled"))
+    try:
+        config["interval_minutes"] = max(1, min(int(config.get("interval_minutes") or 30), 1440))
+    except (TypeError, ValueError):
+        config["interval_minutes"] = DEFAULT_MAIL_PROBE_CONFIG["interval_minutes"]
+    start_time = str(config.get("start_time") or DEFAULT_MAIL_PROBE_CONFIG["start_time"]).strip()
+    try:
+        datetime.strptime(start_time, "%H:%M")
+    except ValueError:
+        start_time = DEFAULT_MAIL_PROBE_CONFIG["start_time"]
+    config["start_time"] = start_time
+    return config
+
+
+def _save_mail_probe_config(config: dict):
+    MAIL_PROBE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MAIL_PROBE_CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _mail_probe_start(now: datetime, start_time: str) -> datetime:
+    hour, minute = (int(part) for part in start_time.split(":", 1))
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _run_mail_probe_once() -> bool:
+    if not _mail_probe_run_lock.acquire(blocking=False):
+        return False
+    try:
+        _update_state(mail_probe_running=True, mail_probe_last_error=None)
+        total = 0
+        accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+        for account in accounts:
+            try:
+                result = _account_mgr.check_all_aliases_mail(
+                    account["id"], limit_per=1, days=30, force=True
+                )
+                total += len(result or {})
+            except Exception as exc:
+                _update_state(mail_probe_last_error=str(exc)[:300])
+                _emit_log("warn", f"邮件探测失败 [{account.get('name', account['id'])}]: {str(exc)[:100]}")
+        timestamp = _beijing_now().isoformat(timespec="seconds")
+        _update_state(mail_probe_last_run=timestamp, round_status=f"邮件探测完成，更新 {total} 个邮箱")
+        _emit_log("info", f"邮件探测完成：活跃账号 {len(accounts)} 个，更新 {total} 个邮箱")
+        return True
+    finally:
+        _update_state(mail_probe_running=False)
+        _mail_probe_run_lock.release()
+
+
+def _mail_probe_loop():
+    last_run_date = None
+    try:
+        while not _mail_probe_stop_event.is_set():
+            config = _mail_probe_config()
+            if not config["enabled"]:
+                _update_state(mail_probe_next_trigger=None, mail_probe_running=False)
+                _mail_probe_wake_event.wait(60)
+                _mail_probe_wake_event.clear()
+                continue
+
+            now = _beijing_now()
+            start = _mail_probe_start(now, config["start_time"])
+            if last_run_date != now.date() and now >= start:
+                trigger = now
+            elif now < start:
+                trigger = start
+            else:
+                candidate = now + timedelta(minutes=config["interval_minutes"])
+                tomorrow = start + timedelta(days=1)
+                trigger = min(candidate, tomorrow)
+
+            wait_seconds = max(0, (trigger - now).total_seconds())
+            _update_state(mail_probe_next_trigger=trigger.timestamp())
+            if _mail_probe_wake_event.wait(wait_seconds):
+                _mail_probe_wake_event.clear()
+                continue
+            if _mail_probe_stop_event.is_set():
+                break
+            if _run_mail_probe_once():
+                last_run_date = _beijing_now().date()
+    finally:
+        _update_state(mail_probe_running=False, mail_probe_next_trigger=None)
+
+
+def _start_mail_probe_thread() -> bool:
+    global _mail_probe_thread
+    if _mail_probe_thread and _mail_probe_thread.is_alive():
+        _mail_probe_wake_event.set()
+        return False
+    _mail_probe_stop_event.clear()
+    _mail_probe_wake_event.clear()
+    _mail_probe_thread = threading.Thread(target=_mail_probe_loop, daemon=True)
+    _mail_probe_thread.start()
+    return True
+
+
+def _stop_mail_probe_thread():
+    _mail_probe_stop_event.set()
+    _mail_probe_wake_event.set()
+
+
+def _mail_probe_payload() -> dict:
+    config = _mail_probe_config()
+    with _lock:
+        state = {
+            "running": bool(_mail_probe_thread and _mail_probe_thread.is_alive()),
+            "probing": bool(_global_state.get("mail_probe_running")),
+            "next_trigger": _global_state.get("mail_probe_next_trigger"),
+            "last_run": _global_state.get("mail_probe_last_run"),
+            "last_error": _global_state.get("mail_probe_last_error"),
+        }
+    return {"ok": True, "config": config, "state": state}
+
 
 def _scheduler_window_is_open(now: datetime | None = None) -> bool:
     current = now or _beijing_now()
@@ -590,8 +725,7 @@ def _health_loop():
         return
     while not _health_stop_event.is_set():
         for account in _account_mgr.list_accounts():
-            # error 账号也要复查，否则一次网络抖动后永远无法自愈。
-            if account.get("status") not in ("active", "error"):
+            if account.get("status") != "active":
                 continue
             try:
                 queued = _queue_account_validation(account["id"], "health")
@@ -635,8 +769,9 @@ def api_keys_revoke(key_id):
 @_require_api_key
 def api_v1_accounts():
     accounts = []
+    mail_attributes = _account_mail_attributes()
     for account in _account_mgr.list_accounts():
-        item = _safe_account(account)
+        item = _safe_account(account, mail_attributes)
         item["has_cookies"] = bool(account.get("cookies"))
         accounts.append(item)
     groups = _groups_with_mailbox_counts()
@@ -850,12 +985,13 @@ def _mailbox_list_payload():
         status=request.args.get("status", ""),
         refresh=refresh,
         sort=sort,
+        mail_kind=request.args.get("mail_kind", ""),
     )
     total = len(items)
     page, limit, offset = _paginate(items)
     meta = _mailbox_service.local_metadata()
     meta["refreshed"] = refresh
-    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh,"sort":normalize_mailbox_sort(sort),"source":meta["source"],"index_updated_at":meta.get("index_updated_at"),"local_alias_count":meta.get("local_alias_count",0),"index_alias_count":meta.get("index_alias_count",0)}
+    return {"ok":True,"mailboxes":page,"count":len(page),"total":total,"limit":limit,"offset":offset,"refreshed":refresh,"sort":normalize_mailbox_sort(sort),"source":meta["source"],"index_updated_at":meta.get("index_updated_at"),"local_alias_count":meta.get("local_alias_count",0),"index_alias_count":meta.get("index_alias_count",0),"mail_probe":_mail_probe_payload()}
 
 @app.route("/api/v1/mailboxes")
 @_require_api_key
@@ -871,6 +1007,12 @@ def api_v1_mailboxes_search():
 @_require_api_key
 def api_v1_mailbox_detail(alias_email):
     return jsonify({"ok":True,"mailbox":_mailbox_service.get_mailbox(alias_email)})
+
+@app.route("/api/v1/mailboxes/<path:alias_email>", methods=["DELETE"])
+@_require_api_key
+def api_v1_delete_mailbox(alias_email):
+    return jsonify({"ok": True, "mailbox": _mailbox_service.delete_mailbox(alias_email)})
+
 
 @app.route("/api/v1/mailboxes/<path:alias_email>/messages")
 @_require_api_key
@@ -910,9 +1052,17 @@ def api_v1_shared_mailboxes_revoke(share_id):
 def api_mailboxes():
     return jsonify(_mailbox_list_payload())
 
+@app.route("/api/mailboxes/probe", methods=["POST"])
+def api_mailboxes_probe():
+    return _queue_mail_probe()
 @app.route("/api/mailboxes/<path:alias_email>")
 def api_mailbox_detail(alias_email):
     return jsonify({"ok":True,"mailbox":_mailbox_service.get_mailbox(alias_email)})
+
+@app.route("/api/mailboxes/<path:alias_email>", methods=["DELETE"])
+def api_delete_mailbox(alias_email):
+    result = _mailbox_service.delete_mailbox(alias_email)
+    return jsonify({"ok": True, "mailbox": result})
 
 @app.route("/api/mailboxes/<path:alias_email>/messages")
 def api_mailbox_messages(alias_email):
@@ -1004,6 +1154,7 @@ def shared_page(shared_key):
 def api_state():
     summary = _account_mgr.get_summary()
     alive = bool(_scheduler_thread and _scheduler_thread.is_alive())
+    probe_alive = bool(_mail_probe_thread and _mail_probe_thread.is_alive())
     with _lock:
         state = dict(_global_state); state.update(summary)
         state["cookies_ok"] = summary["active_accounts"] > 0
@@ -1015,17 +1166,19 @@ def api_state():
             state["running"] = False
             state["round_status"] = state.get("round_status") or "调度器线程已结束"
         state["scheduler_alive"] = alive
+        state["mail_probe_alive"] = probe_alive
         state["log_retention_days"] = _log_store.retention_days
     return jsonify(state)
 
 @app.route("/api/accounts")
 def api_accounts():
     accounts = _account_mgr.list_accounts()
+    mail_attributes = _account_mail_attributes()
     safe = []
-    for a in accounts:
-        ac = _safe_account(a)
-        ac["has_cookies"] = bool(a.get("cookies"))
-        safe.append(ac)
+    for account in accounts:
+        item = _safe_account(account, mail_attributes)
+        item["has_cookies"] = bool(account.get("cookies"))
+        safe.append(item)
     groups = _groups_with_mailbox_counts()
     imap_configs = _list_imap_configs_safe()
     return jsonify({"accounts":safe,"count":len(safe),"groups":groups,"imap_configs":imap_configs})
@@ -1491,6 +1644,45 @@ def api_scheduler_stop():
     _stop_event.set()
     return jsonify({"ok":True})
 
+@app.route("/api/mail-probe/config", methods=["GET", "PUT"])
+def api_mail_probe_config():
+    if request.method == "GET":
+        return jsonify(_mail_probe_payload())
+    data = request.get_json(silent=True) or {}
+    config = {
+        "enabled": bool(data.get("enabled")),
+        "interval_minutes": data.get("interval_minutes", 30),
+        "start_time": str(data.get("start_time") or "08:00").strip(),
+    }
+    try:
+        config["interval_minutes"] = max(1, min(int(config["interval_minutes"]), 1440))
+    except (TypeError, ValueError):
+        raise ValueError("探测间隔必须是 1-1440 分钟")
+    try:
+        datetime.strptime(config["start_time"], "%H:%M")
+    except ValueError as exc:
+        raise ValueError("每日启动时间必须是 HH:MM") from exc
+    _save_mail_probe_config(config)
+    if config["enabled"]:
+        _start_mail_probe_thread()
+    else:
+        _stop_mail_probe_thread()
+    return jsonify(_mail_probe_payload())
+
+
+def _queue_mail_probe():
+    thread = threading.Thread(target=_run_mail_probe_once, daemon=True)
+    thread.start()
+    return jsonify({"ok": True, "queued": True})
+
+
+@app.route("/api/mail-probe/run", methods=["POST"])
+def api_mail_probe_run():
+    return _queue_mail_probe()
+
+
+
+
 @app.route("/api/logs")
 def api_logs():
     limit = request.args.get("limit", 200, type=int)
@@ -1528,7 +1720,10 @@ def main():
     if _auto_start_scheduler_requested(args):
         started = _start_scheduler_thread()
         print("[+] Scheduler auto-started" if started else "[+] Scheduler already running")
-    def _shutdown(sig,frame): print("\n[*] Shutting down..."); _stop_event.set(); _health_stop_event.set(); os._exit(0)
+    if _mail_probe_config()["enabled"]:
+        _start_mail_probe_thread()
+        print("[+] Mail probe auto-started")
+    def _shutdown(sig,frame): print("\n[*] Shutting down..."); _stop_event.set(); _health_stop_event.set(); _stop_mail_probe_thread(); os._exit(0)
     _signal.signal(_signal.SIGINT, _shutdown)
     _signal.signal(_signal.SIGTERM, _shutdown)
     try:
