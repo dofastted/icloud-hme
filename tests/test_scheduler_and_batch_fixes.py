@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 import sys
 import subprocess
 from pathlib import Path
@@ -336,34 +337,85 @@ def test_create_aliases_sleeps_between_attempts(monkeypatch, tmp_path):
 
 def test_mail_probe_config_validates_and_persists(monkeypatch, tmp_path):
     config_file = tmp_path / "mail_probe_config.json"
+    state_file = tmp_path / "mail_probe_state.json"
     monkeypatch.setattr(web_ui, "MAIL_PROBE_CONFIG_FILE", config_file)
+    monkeypatch.setattr(web_ui, "MAIL_PROBE_STATE_FILE", state_file)
     started = []
-    stopped = []
     monkeypatch.setattr(web_ui, "_start_mail_probe_thread", lambda: started.append(True) or True)
-    monkeypatch.setattr(web_ui, "_stop_mail_probe_thread", lambda: stopped.append(True))
     client = web_ui.app.test_client()
 
     saved = client.put(
         "/api/mail-probe/config",
-        json={"enabled": True, "interval_minutes": 45, "start_time": "09:30"},
+        json={
+            "enabled": True,
+            "interval_minutes": 45,
+            "start_time": "09:30",
+            "end_time": "21:00",
+            "limit_per": 3,
+            "days": 7,
+            "force": False,
+            "account_ids": ["acc_missing"],
+        },
     )
     assert saved.status_code == 200
-    assert saved.json["config"] == {"enabled": True, "interval_minutes": 45, "start_time": "09:30"}
+    assert saved.json["config"] == {
+        "enabled": True,
+        "interval_minutes": 45,
+        "start_time": "09:30",
+        "end_time": "21:00",
+        "limit_per": 3,
+        "days": 7,
+        "force": False,
+        "account_ids": [],
+    }
     assert started == [True]
-    assert json.loads(config_file.read_text(encoding="utf-8"))["interval_minutes"] == 45
+    assert json.loads(config_file.read_text(encoding="utf-8"))["limit_per"] == 3
 
-    invalid = client.put(
-        "/api/mail-probe/config",
-        json={"enabled": True, "interval_minutes": 45, "start_time": "25:00"},
-    )
-    assert invalid.status_code == 400
+    for payload in (
+        {"enabled": True, "start_time": "25:00"},
+        {"enabled": True, "interval_minutes": 0},
+        {"enabled": True, "limit_per": 99},
+        {"enabled": True, "days": 0},
+    ):
+        assert client.put("/api/mail-probe/config", json=payload).status_code == 400
 
-    disabled = client.put(
-        "/api/mail-probe/config",
-        json={"enabled": False, "interval_minutes": 45, "start_time": "09:30"},
-    )
-    assert disabled.status_code == 200
-    assert stopped == [True]
+    # 未传的字段保留已存值，避免部分更新把间隔/时间窗重置成默认。
+    partial = client.put("/api/mail-probe/config", json={"enabled": False})
+    assert partial.status_code == 200
+    assert partial.json["config"]["interval_minutes"] == 45
+    assert partial.json["config"]["end_time"] == "21:00"
+
+
+def test_mail_probe_toggle_keeps_watcher_thread_armed(monkeypatch, tmp_path):
+    """停用后再启用不得让守护线程失活，否则自动探测永远不会触发。"""
+    monkeypatch.setattr(web_ui, "MAIL_PROBE_CONFIG_FILE", tmp_path / "mail_probe_config.json")
+    monkeypatch.setattr(web_ui, "MAIL_PROBE_STATE_FILE", tmp_path / "mail_probe_state.json")
+    monkeypatch.setattr(web_ui, "_run_mail_probe_once", lambda config=None: True)
+    client = web_ui.app.test_client()
+    web_ui._stop_mail_probe_thread()
+    web_ui._mail_probe_thread = None
+
+    try:
+        assert client.put("/api/mail-probe/config", json={"enabled": True}).json["state"]["running"] is True
+        assert client.put("/api/mail-probe/config", json={"enabled": False}).json["state"]["thread_alive"] is True
+        enabled = client.put("/api/mail-probe/config", json={"enabled": True})
+        assert enabled.json["state"]["thread_alive"] is True
+        assert enabled.json["state"]["running"] is True
+    finally:
+        web_ui._stop_mail_probe_thread()
+
+
+def test_mail_probe_next_trigger_respects_window_and_interval():
+    config = dict(web_ui.DEFAULT_MAIL_PROBE_CONFIG, start_time="08:00", end_time="20:00", interval_minutes=30)
+    day = datetime(2026, 8, 26, tzinfo=web_ui.BEIJING_TZ)
+
+    before = web_ui._mail_probe_next_trigger(day.replace(hour=6), config, None)
+    inside = web_ui._mail_probe_next_trigger(day.replace(hour=9), config, day.replace(hour=8, minute=50).timestamp())
+    after = web_ui._mail_probe_next_trigger(day.replace(hour=21), config, None)
+
+    assert before == day.replace(hour=8)
+    assert inside == day.replace(hour=9, minute=20)
+    assert after == day.replace(hour=8) + timedelta(days=1)
 
 def test_mail_probe_run_uses_mailbox_compatibility_path(monkeypatch):
     monkeypatch.setattr(web_ui, "_run_mail_probe_once", lambda: True)

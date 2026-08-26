@@ -75,6 +75,7 @@ curl -X POST "$BASE_URL/api/keys/key_xxx/revoke" \
 | `GET` | `/api/v1/mailboxes` | 列出或搜索邮箱 |
 | `GET` | `/api/v1/mailboxes/search` | 搜索邮箱快捷入口 |
 | `GET` | `/api/v1/mailboxes/{alias}` | 查看邮箱详情 |
+| `DELETE` | `/api/v1/mailboxes/{alias}` | 删除邮箱：本地缺 anonymousId 时会现场向 Apple 查一次；查不到返回 409，加 `?local_only=1` 才只清本地记录 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages` | 读取邮箱邮件列表 |
 | `GET` | `/api/v1/mailboxes/{alias}/messages/{message_id}` | 读取邮件正文 |
 | `POST` | `/api/v1/shared-mailboxes` | 创建共享兑换码 |

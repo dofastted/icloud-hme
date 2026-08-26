@@ -56,6 +56,10 @@ class IMAPUnavailable(RuntimeError):
     """The mail backend failed while reading messages."""
 
 
+class AliasRemoteIdUnavailable(RuntimeError):
+    """Apple alias id could not be resolved, so remote deletion is unsafe."""
+
+
 def normalize_mail_filter(value: str) -> str:
     raw = str(value or "").strip().lower()
     return raw if raw in {"claude", "openai", "empty"} else ""
@@ -227,16 +231,30 @@ class MailboxService:
     def get_message_detail(self, alias_email: str, message_id: str) -> Dict:
         account, _meta = self.resolve_alias(alias_email)
         return self._get_message_detail_for_account(account, alias_email, message_id)
-    def delete_mailbox(self, alias_email: str) -> Dict:
+    def delete_mailbox(self, alias_email: str, local_only: bool = False) -> Dict:
         account, mailbox = self.resolve_alias(alias_email)
         alias = mailbox["alias_email"]
         anonymous_id = str(mailbox.get("anonymous_id") or "").strip()
+        warning = ""
+        if not anonymous_id and not local_only:
+            # 本地索引可能是旧版本写入的（没有 anonymousId），或别名建于上次同步之后，
+            # 这时必须现场向 Apple 查一次，否则删除只会清本地记录。
+            anonymous_id, absent_remotely = self._remote_alias_id(account["id"], alias)
+            if not anonymous_id and not absent_remotely:
+                raise AliasRemoteIdUnavailable(
+                    "无法从 Apple 获取该别名标识，请先云端同步或确认账号会话有效；"
+                    "如只想清理本地记录，请使用 local_only=1"
+                )
+            if not anonymous_id:
+                warning = "别名在 Apple 侧已不存在，仅清理本地记录"
         remote_deleted = False
-        if anonymous_id:
+        if anonymous_id and not local_only:
             ok = self.account_mgr.delete_alias_for_account(account["id"], anonymous_id)
             if not ok:
                 raise RuntimeError("Apple 别名删除失败")
             remote_deleted = True
+        elif local_only and not warning:
+            warning = "按请求仅清理本地记录，Apple 别名保留"
 
         local_removed = self._purge_local_mailbox(alias, account["id"])
         shared_revoked = False
@@ -245,11 +263,31 @@ class MailboxService:
             shared_revoked = self.shared_store.revoke(shared["id"])
         return {
             "alias_email": alias,
+            "anonymous_id": anonymous_id,
             "remote_deleted": remote_deleted,
             "local_removed": local_removed,
             "shared_revoked": shared_revoked,
-            "warning": "缺少 Apple 别名标识，仅清理本地记录" if not anonymous_id else "",
+            "warning": warning,
         }
+
+    def _remote_alias_id(self, account_id: str, alias: str) -> Tuple[str, bool]:
+        """返回 (anonymousId, 已确认远端不存在)。两者都为空/False 表示查询失败。"""
+        fetch = getattr(self.account_mgr, "get_aliases_for_account", None)
+        if not callable(fetch):
+            return "", False
+        try:
+            aliases = fetch(account_id) or []
+        except Exception:
+            return "", False
+        for item in aliases:
+            candidate = _normalize_alias(
+                item.get("hme") or item.get("email") or item.get("alias_email")
+            )
+            if candidate == alias:
+                return str(
+                    item.get("anonymousId") or item.get("anonymous_id") or item.get("id") or ""
+                ).strip(), False
+        return "", bool(aliases)
 
     def _purge_local_mailbox(self, alias: str, account_id: str) -> List[str]:
         touched: List[str] = []

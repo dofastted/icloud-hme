@@ -27,3 +27,5 @@ shared_mailboxes.json
 test-acc-session.txt
 latest_emails.txt
 mail_cache.json
+mail_probe_config.json
+mail_probe_state.json

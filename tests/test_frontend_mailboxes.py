@@ -188,3 +188,72 @@ const context={window:{HME:S},location:{hash:'#/mailboxes?mail_kind=claude'},URL
 (async()=>{await S.renderMailboxes(false); if(!requested.includes('mail_kind=claude'))throw Error('kind query missing: '+requested); if(!rendered.includes('Claude')||!rendered.includes('OpenAI'))throw Error('provider badges missing: '+rendered); if(!rendered.includes('空邮箱'))throw Error('empty filter missing');})().catch(e=>{console.error(e.stack);process.exit(1)});
 '''
     run_node(script)
+
+
+def test_mailbox_list_paginates_and_renders_copy_button():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+let requested = '';
+let navigated = '';
+const rows = Array.from({length:20}).map((_, i) => ({alias_email:'a' + i + '@icloud.com', account_name:'Main', group_name:'可用', is_active:true}));
+const S = {
+  accounts: [], groups: [], mailboxes: [],
+  E(){ return null; },
+  esc(v){ return String(v == null ? '' : v); },
+  inlineArg(v){ return JSON.stringify(v); },
+  setTitle(){}, empty(v){ return v; }, error(e){ return String(e); },
+  view(h){ rendered = h; }, debounce(){}, navigate(h){ navigated = h; }, toast(){},
+  async api(path){ requested = path; return {ok:true, total:643, limit:20, offset:40, mailboxes:rows}; }
+};
+const context = {window:{HME:S}, location:{hash:'#/mailboxes?page=3&limit=20'}, URLSearchParams, encodeURIComponent, console};
+vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context);
+(async () => {
+  await S.renderMailboxes(false);
+  if (!requested.includes('limit=20') || !requested.includes('offset=40')) throw new Error('page query missing: ' + requested);
+  if (!rendered.includes('第 3 / 33 页') || !rendered.includes('共 643 个')) throw new Error('pager missing: ' + rendered);
+  if (!rendered.includes('>41<')) throw new Error('row numbering ignores offset: ' + rendered);
+  if (!rendered.includes('HME.copyText')) throw new Error('copy button missing');
+  S.gotoMailboxPage(4);
+  if (navigated !== '#/mailboxes?page=4&limit=20') throw new Error('page navigation wrong: ' + navigated);
+  S.setMailboxPageSize(50);
+  if (navigated !== '#/mailboxes') throw new Error('page size reset wrong: ' + navigated);
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    run_node(script)
+
+
+def test_mailbox_delete_falls_back_to_local_only_cleanup():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const calls = [];
+const toasts = [];
+const S = {
+  accounts: [], groups: [], mailboxes: [],
+  E(){ return null; },
+  esc(v){ return String(v == null ? '' : v); },
+  inlineArg(v){ return JSON.stringify(v); },
+  setTitle(){}, empty(v){ return v; }, error(e){ return String(e); }, view(){}, debounce(){},
+  toast(msg){ toasts.push(msg); },
+  async refreshAll(){},
+  async api(path, opts){
+    calls.push(path);
+    if (!path.includes('local_only=1')) {
+      const err = new Error('无法从 Apple 获取该别名标识');
+      err.code = 'alias_id_unresolved';
+      throw err;
+    }
+    return {ok:true, mailbox:{warning:'按请求仅清理本地记录，Apple 别名保留'}};
+  }
+};
+const context = {window:{HME:S}, location:{hash:'#/mailboxes'}, URLSearchParams, encodeURIComponent, console, confirm: () => true};
+vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context);
+(async () => {
+  await S.deleteMailbox('a@icloud.com');
+  if (calls.length !== 2 || !calls[1].includes('local_only=1')) throw new Error('local-only retry missing: ' + JSON.stringify(calls));
+  if (!toasts.some(t => t.includes('仅清理本地记录'))) throw new Error('warning toast missing: ' + JSON.stringify(toasts));
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    run_node(script)

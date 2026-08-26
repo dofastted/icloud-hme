@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from mailbox_service import IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
+from mailbox_service import AliasRemoteIdUnavailable, IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService
 from shared_mailboxes import SharedMailboxStore
 
 
@@ -333,14 +333,68 @@ def test_list_mailboxes_derives_provider_flags_and_filters_from_cache(tmp_path):
     assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="claude")] == ["alias@icloud.com"]
     assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="openai")] == ["alias@icloud.com"]
     assert [item["alias_email"] for item in svc.list_mailboxes(mail_kind="empty")] == ["local@icloud.com"]
-def test_delete_mailbox_cleans_local_record_without_remote_id(tmp_path):
+class DeletingManager(FakeManager):
+    def __init__(self, remote_aliases):
+        super().__init__()
+        self.remote_aliases = remote_aliases
+        self.deleted = []
+
+    def get_aliases_for_account(self, acc_id):
+        return list(self.remote_aliases)
+
+    def delete_alias_for_account(self, acc_id, anonymous_id):
+        self.deleted.append((acc_id, anonymous_id))
+        return True
+
+
+def test_delete_mailbox_resolves_missing_anonymous_id_from_apple(tmp_path):
+    """本地索引缺 anonymousId 时必须现场向 Apple 查，否则删除只清本地。"""
     latest = latest_file(tmp_path)
-    svc = MailboxService(FakeManager(), latest_emails_path=latest, index_path=tmp_path / "idx.json")
+    manager = DeletingManager([{"hme": "alias@icloud.com", "anonymousId": "anon-9"}])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    result = svc.delete_mailbox("alias@icloud.com")
+
+    assert result["remote_deleted"] is True
+    assert result["anonymous_id"] == "anon-9"
+    assert result["warning"] == ""
+    assert manager.deleted == [("acc_1", "anon-9")]
+    assert "alias@icloud.com" not in latest.read_text(encoding="utf-8")
+
+
+def test_delete_mailbox_treats_alias_absent_on_apple_as_local_cleanup(tmp_path):
+    latest = latest_file(tmp_path)
+    manager = DeletingManager([{"hme": "other@icloud.com", "anonymousId": "anon-1"}])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
 
     result = svc.delete_mailbox("alias@icloud.com")
 
     assert result["remote_deleted"] is False
-    assert "缺少 Apple 别名标识" in result["warning"]
+    assert "Apple 侧已不存在" in result["warning"]
+    assert manager.deleted == []
     assert "alias@icloud.com" not in latest.read_text(encoding="utf-8")
+
+
+def test_delete_mailbox_refuses_when_apple_lookup_fails(tmp_path):
+    latest = latest_file(tmp_path)
+    manager = DeletingManager([])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    with pytest.raises(AliasRemoteIdUnavailable):
+        svc.delete_mailbox("alias@icloud.com")
+
+    assert "alias@icloud.com" in latest.read_text(encoding="utf-8")
+
+
+def test_delete_mailbox_local_only_skips_apple(tmp_path):
+    latest = latest_file(tmp_path)
+    manager = DeletingManager([{"hme": "alias@icloud.com", "anonymousId": "anon-9"}])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    result = svc.delete_mailbox("alias@icloud.com", local_only=True)
+
+    assert result["remote_deleted"] is False
+    assert "仅清理本地记录" in result["warning"]
+    assert manager.deleted == []
     assert [item["alias_email"] for item in svc.list_mailboxes()] == ["local@icloud.com"]
 

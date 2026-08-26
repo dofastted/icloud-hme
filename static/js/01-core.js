@@ -14,8 +14,27 @@
     async api(path, opts){
       const res = await fetch(path, opts || {});
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + res.status));
+      if (!res.ok || data.ok === false) {
+        const err = new Error(data.error || ('HTTP ' + res.status));
+        err.code = data.code || '';
+        err.status = res.status;
+        throw err;
+      }
       return data;
+    },
+    async copyText(text, label){
+      const value = String(text == null ? '' : text);
+      try {
+        await navigator.clipboard.writeText(value);
+      } catch (err) {
+        const box = document.createElement('textarea');
+        box.value = value;
+        document.body.appendChild(box);
+        box.select();
+        document.execCommand('copy');
+        box.remove();
+      }
+      S.toast(label || ('已复制 ' + value));
     },
     toast(msg, err){
       const t = S.E('toast');
