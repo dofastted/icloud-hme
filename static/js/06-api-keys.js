@@ -14,9 +14,9 @@
     } catch (_) {}
   }
 
-  function authHeaders(){
+  function authHeaders() {
     const key = storedKey();
-    return key ? {'Authorization':'Bearer ' + key} : {};
+    return key ? { 'X-API-Key': key } : {};
   }
 
   async function keyApi(path, opts){
