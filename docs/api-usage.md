@@ -531,7 +531,8 @@ GET /api/shared/<redemption_code>/latest?force=0
 | `PUT` | `/api/groups/{id}` | 更新自定义邮箱分组 |
 | `DELETE` | `/api/groups/{id}` | 删除自定义邮箱分组，邮箱回到“可用”分组 |
 | `PUT` | `/api/groups/reorder` | 调整自定义分组顺序 |
-| `POST` | `/api/mailboxes/batch-update-group` | 批量移动 HME 邮箱到指定分组 |
+| `POST` | `/api/mailboxes/batch-update-group` | 批量移动 HME 邮箱到指定分组，单次最多 200 个 |
+| `POST` | `/api/mailboxes/batch-delete` | 批量删除 HME 邮箱，单次最多 200 个；返回逐条结果，`local_only=true` 只清本地记录 |
 | `POST` | `/api/accounts/{id}/remove` | 删除账号 |
 | `POST` | `/api/accounts/{id}/validate` | 校验账号会话 |
 | `POST` | `/api/accounts/{id}/create` | 单账号创建 HME |

@@ -77,12 +77,18 @@ class DeletableManager(FakeManager):
     def get_all_aliases(self):
         return [{"hme": "alias@icloud.com", "account_id": "acc_1", "account_name": "Main", "label": "Login", "isActive": True, "anonymousId": "anon-1"}]
 
-    def delete_alias_for_account(self, acc_id, anonymous_id):
+    def delete_alias_for_account(self, acc_id, anonymous_id, refresh_counts=True):
         self.deleted.append((acc_id, anonymous_id))
         return True
 
     def move_mailboxes_to_group(self, alias_emails, group_id):
         return len(alias_emails)
+
+    def get_aliases_for_account(self, acc_id):
+        return [{"hme": "alias@icloud.com", "anonymousId": "anon-1"}]
+
+    def refresh_alias_counts(self, acc_id):
+        return None
 
 
 def configure_manager(monkeypatch, tmp_path, manager):
@@ -284,6 +290,51 @@ def test_v1_delete_mailbox_deletes_remote_alias_and_local_records(monkeypatch, t
     assert deleted.json["mailbox"]["remote_deleted"] is True
     assert manager.deleted == [("acc_1", "anon-1")]
     assert client.get("/api/v1/mailboxes", headers=headers).json["total"] == 0
+
+def test_batch_delete_mailboxes_reports_summary(monkeypatch, tmp_path):
+    manager = DeletableManager()
+    client, _key, _store = configure_manager(monkeypatch, tmp_path, manager)
+
+    deleted = client.post(
+        "/api/mailboxes/batch-delete",
+        json={"alias_emails": ["alias@icloud.com", "ghost@icloud.com"]},
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json["deleted"] == 1
+    assert deleted.json["remote_deleted"] == 1
+    assert deleted.json["failed"] == 1
+    assert manager.deleted == [("acc_1", "anon-1")]
+    codes = {item["alias_email"]: item.get("code") for item in deleted.json["results"]}
+    assert codes["ghost@icloud.com"] == "not_found"
+
+
+def test_batch_endpoints_reject_empty_and_oversized_selection(monkeypatch, tmp_path):
+    client, _key, _store = configure_manager(monkeypatch, tmp_path, DeletableManager())
+    oversized = [f"a{index}@icloud.com" for index in range(web_ui.BATCH_MAILBOX_LIMIT + 1)]
+
+    for path in ("/api/mailboxes/batch-delete", "/api/mailboxes/batch-update-group"):
+        empty = client.post(path, json={"alias_emails": []})
+        assert empty.status_code == 400
+        assert "请先选择邮箱" in empty.json["error"]
+        too_many = client.post(path, json={"alias_emails": oversized, "group_id": "grp_claude"})
+        assert too_many.status_code == 400
+        assert str(web_ui.BATCH_MAILBOX_LIMIT) in too_many.json["error"]
+
+
+def test_batch_delete_local_only_skips_apple(monkeypatch, tmp_path):
+    manager = DeletableManager()
+    client, _key, _store = configure_manager(monkeypatch, tmp_path, manager)
+
+    deleted = client.post(
+        "/api/mailboxes/batch-delete",
+        json={"alias_emails": ["alias@icloud.com"], "local_only": True},
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json["deleted"] == 1
+    assert deleted.json["remote_deleted"] == 0
+    assert manager.deleted == []
 
 
 

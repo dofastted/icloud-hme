@@ -1384,15 +1384,46 @@ def api_update_group(group_id):
 def api_delete_group(group_id):
     return jsonify({"ok":_account_mgr.delete_group(group_id)})
 
+BATCH_MAILBOX_LIMIT = 200
+
+
+def _batch_alias_list(data) -> list:
+    aliases = data.get("alias_emails") or data.get("aliases") or data.get("mailboxes") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if not isinstance(aliases, (list, tuple)):
+        raise ValueError("alias_emails 必须是邮箱列表")
+    cleaned = [str(item).strip() for item in aliases if str(item).strip()]
+    if not cleaned:
+        raise ValueError("请先选择邮箱")
+    if len(cleaned) > BATCH_MAILBOX_LIMIT:
+        raise ValueError(f"单次批量操作最多 {BATCH_MAILBOX_LIMIT} 个邮箱")
+    return cleaned
+
+
 @app.route("/api/mailboxes/batch-group", methods=["POST"])
 @app.route("/api/mailboxes/batch-update-group", methods=["POST"])
 def api_mailboxes_batch_update_group():
     data = request.get_json() or {}
-    aliases = data.get("alias_emails") or data.get("aliases") or data.get("mailboxes") or []
-    if isinstance(aliases, str):
-        aliases = [aliases]
+    aliases = _batch_alias_list(data)
     moved = _account_mgr.move_mailboxes_to_group(aliases, data.get("group_id", ""))
-    return jsonify({"ok":True,"moved":moved})
+    _emit_log("info", f"批量移动分组：{moved}/{len(aliases)} 个邮箱", tag="batch")
+    return jsonify({"ok":True,"moved":moved,"requested":len(aliases)})
+
+
+@app.route("/api/mailboxes/batch-delete", methods=["POST"])
+def api_mailboxes_batch_delete():
+    data = request.get_json() or {}
+    aliases = _batch_alias_list(data)
+    local_only = bool(data.get("local_only"))
+    summary = _mailbox_service.delete_mailboxes(aliases, local_only=local_only)
+    level = "warn" if summary["failed"] else "info"
+    _emit_log(
+        level,
+        f"批量删除邮箱：成功 {summary['deleted']}（Apple {summary['remote_deleted']}），失败 {summary['failed']}",
+        tag="batch",
+    )
+    return jsonify({"ok":True, **summary})
 
 @app.route("/api/accounts/add", methods=["POST"])
 def api_add_account():

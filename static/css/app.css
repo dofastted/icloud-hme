@@ -3,3 +3,4 @@
 .modal-box input{width:100%;margin:8px 0 12px}.modal-box .label{display:block;margin-top:10px}
 .badge.provider{display:inline-block;font-size:11px;line-height:1.4;padding:1px 6px;border:1px solid currentColor;border-radius:999px;vertical-align:middle;font-family:var(--sans);font-weight:600}.badge.provider.claude{color:#8b4513}.badge.provider.openai{color:#147a43}
 .btn-xs{padding:2px 8px;font-size:11px;line-height:1.5}.cell-copy{display:inline-flex;align-items:center;gap:8px}.pager{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:14px 18px;border-top:1px solid var(--rule)}.probe-panel .filter-row label{display:inline-flex;align-items:center;gap:6px}
+.selection-bar{align-items:center;background:var(--paper-dim)}.selection-bar label{display:inline-flex;align-items:center;gap:6px}.select-cell{width:28px;text-align:center}

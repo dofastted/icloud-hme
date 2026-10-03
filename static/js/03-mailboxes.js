@@ -6,6 +6,56 @@
     return new URLSearchParams(raw);
   }
 
+  const selection = new Set();
+
+  function pageAliases(){
+    return (S.mailboxes || []).map(m => m.alias_email);
+  }
+
+  function selectionBarHtml(){
+    const count = selection.size;
+    const disabled = count ? '' : ' disabled';
+    return '<div class="filter-row selection-bar"><label><input id="mailboxSelectAll" type="checkbox"> 全选本页</label>'
+      + '<span class="muted mono" id="mailboxSelectedCount">已选 ' + count + ' 个</span>'
+      + '<button class="btn btn-outline btn-sm"' + disabled + ' onclick="HME.showBatchGroupModal()">批量移动分组</button>'
+      + '<button class="btn btn-outline btn-sm"' + disabled + ' onclick="HME.copySelectedMailboxes()">复制所选</button>'
+      + '<button class="btn btn-danger btn-sm"' + disabled + ' onclick="HME.batchDeleteMailboxes()">批量删除</button>'
+      + '<button class="btn btn-outline btn-sm"' + disabled + ' onclick="HME.clearMailboxSelection()">清空选择</button></div>';
+  }
+
+  function refreshSelectionUI(){
+    const label = S.E('mailboxSelectedCount');
+    if (label) label.textContent = '已选 ' + selection.size + ' 个';
+    const aliases = pageAliases();
+    const all = S.E('mailboxSelectAll');
+    if (all) all.checked = aliases.length > 0 && aliases.every(alias => selection.has(alias));
+    const bar = S.E('mailboxSelectedCount')?.parentElement;
+    if (bar) bar.querySelectorAll('button').forEach(btn => { btn.disabled = selection.size === 0; });
+  }
+
+  S.toggleMailboxSelection = function(alias, checked){
+    if (checked) selection.add(alias); else selection.delete(alias);
+    refreshSelectionUI();
+  };
+
+  S.toggleMailboxPageSelection = function(checked){
+    pageAliases().forEach(alias => { if (checked) selection.add(alias); else selection.delete(alias); });
+    document.querySelectorAll('input.mailbox-select').forEach(box => { box.checked = checked; });
+    refreshSelectionUI();
+  };
+
+  S.clearMailboxSelection = function(){
+    selection.clear();
+    document.querySelectorAll('input.mailbox-select').forEach(box => { box.checked = false; });
+    refreshSelectionUI();
+  };
+
+  S.copySelectedMailboxes = function(){
+    const aliases = Array.from(selection);
+    if (!aliases.length) return;
+    S.copyText(aliases.join('\n'), '已复制所选 ' + aliases.length + ' 个邮箱');
+  };
+
   function mailReadError(err){
     const msg = String((err && err.message) || err || '邮件读取暂不可用');
     if (msg.includes('邮件登录' + '失败') || msg.includes('邮件认证' + '凭据')) return '邮件读取暂不可用';
@@ -59,13 +109,14 @@
       const shareAction = m.shared
         ? '<button class="btn btn-outline btn-sm" onclick="HME.revokeShare(' + S.inlineArg(m.shared.id) + ',' + aliasArg + ')">吊销共享</button>'
         : '<button class="btn btn-outline btn-sm" onclick="HME.createShare(' + aliasArg + ')">共享</button>';
-      return '<tr><td>' + (base + i + 1) + '</td><td><span class="cell-copy"><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a><button class="btn btn-outline btn-xs" title="复制邮箱地址" onclick="HME.copyText(' + aliasArg + ')">复制</button></span></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + latest + '</td><td class="mono">' + S.esc(formatCreatedAt(m.created_at)) + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> ' + shareAction + ' <button class="btn btn-danger btn-sm" onclick="HME.deleteMailbox(' + aliasArg + ')">删除</button></td></tr>';
+      const checkbox = '<input class="mailbox-select" type="checkbox"' + (selection.has(m.alias_email) ? ' checked' : '') + ' onchange="HME.toggleMailboxSelection(' + aliasArg + ', this.checked)">';
+      return '<tr><td class="select-cell">' + checkbox + '</td><td>' + (base + i + 1) + '</td><td><span class="cell-copy"><a class="link" onclick="HME.navigate(' + routeArg + ')">' + S.esc(m.alias_email) + '</a><button class="btn btn-outline btn-xs" title="复制邮箱地址" onclick="HME.copyText(' + aliasArg + ')">复制</button></span></td><td>' + S.esc(m.account_name || m.account_id) + '</td><td>' + groupBadge(m) + '</td><td>' + latest + '</td><td class="mono">' + S.esc(formatCreatedAt(m.created_at)) + '</td><td>' + (m.is_active ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge err">OFF</span>') + '</td><td>' + (m.shared ? '<span class="badge shared">CODE ' + S.esc(m.shared.prefix) + '</span>' : '--') + '</td><td><button class="btn btn-outline btn-sm" onclick="HME.navigate(' + routeArg + ')">详情</button> <button class="btn btn-outline btn-sm" onclick="HME.showMailboxGroupModal(' + aliasArg + ',' + groupArg + ')">移动分组</button> ' + shareAction + ' <button class="btn btn-danger btn-sm" onclick="HME.deleteMailbox(' + aliasArg + ')">删除</button></td></tr>';
     }).join('');
   }
 
   function mailboxTable(items, offset){
     if (!items || !items.length) return S.empty('暂无邮箱 - 去仪表盘或批量创建生成', '<button class="btn btn-sm" onclick="HME.navigate(\'#/batch\')">去批量创建</button>');
-    return '<div class="table-wrap"><table class="table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>最新邮件</th><th>创建时间</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + mailboxRows(items, offset) + '</tbody></table></div>';
+    return '<div class="table-wrap"><table class="table"><thead><tr><th class="select-cell"></th><th>#</th><th>邮箱地址</th><th>所属账号</th><th>分组</th><th>最新邮件</th><th>创建时间</th><th>状态</th><th>共享</th><th>操作</th></tr></thead><tbody>' + mailboxRows(items, offset) + '</tbody></table></div>';
   }
 
   const PAGE_SIZES = [20, 50, 100];
@@ -152,7 +203,7 @@
     const page = Math.max(1, Number(p.get('page')) || 1);
     const offset = (page - 1) * limit;
     const current = S.mailboxes && S.mailboxes.length ? mailboxTable(S.mailboxes, offset) : S.empty('读取本地邮箱列表...');
-    S.view(mailProbeHtml(null) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(null) + '</span></div>' + filterHtml(q, account, group, status, mailKind, sort, refresh) + '<div id="mailboxListBody">' + current + '</div></div>');
+    S.view(mailProbeHtml(null) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(null) + '</span></div>' + filterHtml(q, account, group, status, mailKind, sort, refresh) + selectionBarHtml() + '<div id="mailboxListBody">' + current + '</div></div>');
     bindFilters();
     try {
       const query = 'q=' + encodeURIComponent(q) + '&account_id=' + encodeURIComponent(account) + '&group_id=' + encodeURIComponent(group) + '&status=' + encodeURIComponent(status) + '&mail_kind=' + encodeURIComponent(mailKind) + '&sort=' + encodeURIComponent(sort) + '&limit=' + limit + '&offset=' + offset + (refresh ? '&refresh=1' : '');
@@ -164,7 +215,7 @@
       const pages = Math.max(1, Math.ceil(total / effectiveLimit));
       if (page > pages && total) return S.gotoMailboxPage(pages);
       const shown = data.offset != null ? data.offset : offset;
-      const finalHtml = mailProbeHtml(probe) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(data) + ' · ' + total + ' total</span></div>' + filterHtml(q, account, group, status, mailKind, sort, false) + '<div id="mailboxListBody">' + mailboxTable(S.mailboxes, shown) + '</div>' + pagerHtml(total, effectiveLimit, page, pages) + '</div>';
+      const finalHtml = mailProbeHtml(probe) + '<div class="panel"><div class="panel-head"><span>隐私邮箱</span><span id="mailboxMeta">' + mailboxSource(data) + ' · ' + total + ' total</span></div>' + filterHtml(q, account, group, status, mailKind, sort, false) + selectionBarHtml() + '<div id="mailboxListBody">' + mailboxTable(S.mailboxes, shown) + '</div>' + pagerHtml(total, effectiveLimit, page, pages) + '</div>';
       S.view(finalHtml);
       bindFilters();
     } catch (err) {
@@ -212,6 +263,9 @@
     const jump = S.E('mailboxPageJump');
     if (perPage) perPage.addEventListener('change', () => S.setMailboxPageSize(perPage.value));
     if (jump) jump.addEventListener('keydown', (event) => { if (event.key === 'Enter') S.jumpMailboxPage(); });
+    const selectAll = S.E('mailboxSelectAll');
+    if (selectAll) selectAll.addEventListener('change', () => S.toggleMailboxPageSelection(selectAll.checked));
+    refreshSelectionUI();
   }
 
   function applyFilters(){
@@ -323,6 +377,7 @@
     try {
       const data = await S.api('/api/mailboxes/' + encodeURIComponent(alias), {method:'DELETE'});
       const warning = data.mailbox && data.mailbox.warning;
+      selection.delete(alias);
       S.toast(warning || '邮箱已删除', Boolean(warning));
       await S.refreshAll();
       return;
@@ -332,6 +387,7 @@
     }
     try {
       const data = await S.api('/api/mailboxes/' + encodeURIComponent(alias) + '?local_only=1', {method:'DELETE'});
+      selection.delete(alias);
       S.toast((data.mailbox && data.mailbox.warning) || '已清理本地记录', true);
       await S.refreshAll();
     } catch (err) { S.toast(err.message, true); }
@@ -351,6 +407,65 @@
     } catch (err) {
       S.E('modalMsg').textContent = err.message;
     }
+  };
+
+  S.showBatchGroupModal = function(){
+    const aliases = Array.from(selection);
+    if (!aliases.length) { S.toast('请先选择邮箱', true); return; }
+    const preview = aliases.slice(0, 5).join('、') + (aliases.length > 5 ? ' 等 ' + aliases.length + ' 个' : '');
+    S.E('modalRoot').innerHTML = '<div class="modal-overlay" onclick="if(event.target===this)HME.closeModal()"><div class="modal-box"><h3><span class="diamond"></span> 批量移动分组</h3><p class="muted mono">已选 ' + aliases.length + ' 个：' + S.esc(preview) + '</p><label class="label">目标分组</label><select id="batchGroupTarget">' + groupOptions('grp_default') + '</select><div class="modal-actions"><button class="btn btn-outline" onclick="HME.closeModal()">取消</button><button class="btn" onclick="HME.batchMoveGroup()">移动</button></div><div id="modalMsg" class="warning"></div></div></div>';
+  };
+
+  S.batchMoveGroup = async function(){
+    const aliases = Array.from(selection);
+    if (!aliases.length) { S.closeModal(); return; }
+    try {
+      const group_id = S.E('batchGroupTarget').value;
+      const data = await S.api('/api/mailboxes/batch-update-group', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({alias_emails:aliases, group_id})});
+      S.closeModal();
+      selection.clear();
+      S.toast('已移动 ' + (data.moved || 0) + '/' + aliases.length + ' 个邮箱');
+      await S.refreshAll();
+    } catch (err) {
+      S.E('modalMsg').textContent = err.message;
+    }
+  };
+
+  async function postBatchDelete(aliases, localOnly){
+    return S.api('/api/mailboxes/batch-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(localOnly ? {alias_emails: aliases, local_only: true} : {alias_emails: aliases}),
+    });
+  }
+
+  function unresolvedAliases(summary){
+    return (summary.results || []).filter(item => item.code === 'alias_id_unresolved').map(item => item.alias_email);
+  }
+
+  S.batchDeleteMailboxes = async function(){
+    const aliases = Array.from(selection);
+    if (!aliases.length) { S.toast('请先选择邮箱', true); return; }
+    if (!confirm('确认删除所选 ' + aliases.length + ' 个邮箱？此操作会删除 Apple 别名及本地记录。')) return;
+    let summary;
+    try {
+      summary = await postBatchDelete(aliases, false);
+    } catch (err) { S.toast(err.message, true); return; }
+
+    const pending = unresolvedAliases(summary);
+    let localSummary = null;
+    if (pending.length && confirm('有 ' + pending.length + ' 个邮箱无法从 Apple 获取别名标识。\n\n点击确定仅清理它们的本地记录（Apple 别名保留）。')) {
+      try {
+        localSummary = await postBatchDelete(pending, true);
+      } catch (err) { S.toast(err.message, true); }
+    }
+
+    const deleted = summary.deleted + (localSummary ? localSummary.deleted : 0);
+    const failed = summary.failed - (localSummary ? localSummary.deleted : 0);
+    (summary.results || []).forEach(item => { if (item.ok) selection.delete(item.alias_email); });
+    (localSummary && localSummary.results || []).forEach(item => { if (item.ok) selection.delete(item.alias_email); });
+    S.toast('已删除 ' + deleted + '/' + aliases.length + ' 个邮箱' + (failed > 0 ? '，失败 ' + failed + ' 个' : ''), failed > 0);
+    await S.refreshAll();
   };
 
   S.forceMailbox = async function(alias){

@@ -257,3 +257,75 @@ vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context
 })().catch(err => { console.error(err.stack || err.message); process.exit(1); });
 '''
     run_node(script)
+
+
+def test_mailbox_batch_selection_drives_move_and_delete():
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let rendered = '';
+const calls = [];
+const toasts = [];
+const nodes = {batchGroupTarget:{value:'grp_claude'}};
+const rows = [
+  {alias_email:'a@icloud.com', account_name:'Main', group_name:'可用', is_active:true},
+  {alias_email:'b@icloud.com', account_name:'Main', group_name:'可用', is_active:true},
+];
+const S = {
+  accounts: [], groups: [{id:'grp_claude', name:'Claude'}], mailboxes: [],
+  E(id){ return nodes[id] || null; },
+  esc(v){ return String(v == null ? '' : v); },
+  inlineArg(v){ return JSON.stringify(v); },
+  setTitle(){}, empty(v){ return v; }, error(e){ return String(e); },
+  view(h){ rendered = h; }, debounce(){}, navigate(){}, closeModal(){},
+  toast(msg){ toasts.push(msg); },
+  async refreshAll(){},
+  async copyText(text, label){ toasts.push(label); },
+  async api(path, opts){
+    calls.push({path, body: opts && opts.body ? JSON.parse(opts.body) : null});
+    if (path.startsWith('/api/mailboxes?')) return {ok:true, total:2, limit:50, offset:0, mailboxes:rows};
+    if (path === '/api/mailboxes/batch-update-group') return {ok:true, moved:2};
+    if (path === '/api/mailboxes/batch-delete') {
+      const body = opts && opts.body ? JSON.parse(opts.body) : {};
+      if (body.local_only) return {ok:true, deleted:1, remote_deleted:0, failed:0, results:[{alias_email:'b@icloud.com', ok:true, warning:'按请求仅清理本地记录，Apple 别名保留'}]};
+      return {ok:true, deleted:1, remote_deleted:1, failed:1, results:[
+        {alias_email:'a@icloud.com', ok:true, remote_deleted:true},
+        {alias_email:'b@icloud.com', ok:false, code:'alias_id_unresolved', error:'no id'},
+      ]};
+    }
+    return {ok:true};
+  }
+};
+const context = {window:{HME:S}, location:{hash:'#/mailboxes'}, URLSearchParams, encodeURIComponent, console, confirm: () => true, document:{querySelectorAll(){ return []; }}};
+vm.runInNewContext(fs.readFileSync('static/js/03-mailboxes.js', 'utf8'), context);
+(async () => {
+  await S.renderMailboxes(false);
+  if (!rendered.includes('全选本页') || !rendered.includes('批量删除') || !rendered.includes('批量移动分组')) {
+    throw new Error('selection bar missing: ' + rendered);
+  }
+  if (!rendered.includes('HME.toggleMailboxSelection')) throw new Error('row checkbox missing');
+
+  S.toggleMailboxSelection('a@icloud.com', true);
+  S.toggleMailboxSelection('b@icloud.com', true);
+  await S.batchMoveGroup();
+  const move = calls.find(c => c.path === '/api/mailboxes/batch-update-group');
+  if (!move || move.body.group_id !== 'grp_claude' || move.body.alias_emails.length !== 2) {
+    throw new Error('batch move payload wrong: ' + JSON.stringify(move));
+  }
+  if (!toasts.some(t => t.includes('已移动 2/2'))) throw new Error('move toast missing: ' + JSON.stringify(toasts));
+
+  S.toggleMailboxSelection('a@icloud.com', true);
+  S.toggleMailboxSelection('b@icloud.com', true);
+  await S.batchDeleteMailboxes();
+  const deletes = calls.filter(c => c.path === '/api/mailboxes/batch-delete');
+  if (deletes.length !== 2) throw new Error('expected local-only retry: ' + JSON.stringify(deletes));
+  if (deletes[1].body.local_only !== true || deletes[1].body.alias_emails[0] !== 'b@icloud.com') {
+    throw new Error('retry payload wrong: ' + JSON.stringify(deletes[1]));
+  }
+  if (!toasts.some(t => t.includes('已删除 2/2'))) throw new Error('delete toast missing: ' + JSON.stringify(toasts));
+  S.toggleMailboxSelection('c@icloud.com', true);
+  S.copySelectedMailboxes();
+  if (!toasts.some(t => String(t).includes('已复制所选 1 个邮箱'))) throw new Error('copy selection toast missing: ' + JSON.stringify(toasts));
+})().catch(err => { console.error(err.stack || err.message); process.exit(1); });
+'''
+    run_node(script)

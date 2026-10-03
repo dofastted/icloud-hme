@@ -1397,11 +1397,17 @@ class AccountManager:
         self._refresh_alias_counts(acc_id, client)
         return ok
 
-    def delete_alias_for_account(self, acc_id: str, anonymous_id: str) -> bool:
+    def delete_alias_for_account(self, acc_id: str, anonymous_id: str,
+                                 refresh_counts: bool = True) -> bool:
         client = self.get_client(acc_id, verbose=False)
         ok = client.delete(anonymous_id)
-        self._refresh_alias_counts(acc_id, client)
+        # 批量删除时逐条刷新会给每次删除都追加一次 list 请求，改由调用方收尾刷新。
+        if refresh_counts:
+            self._refresh_alias_counts(acc_id, client)
         return ok
+
+    def refresh_alias_counts(self, acc_id: str):
+        self._refresh_alias_counts(acc_id)
 
     def _refresh_alias_counts(self, acc_id: str, client=None):
         account = self.accounts.get(acc_id)

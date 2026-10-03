@@ -338,11 +338,17 @@ class DeletingManager(FakeManager):
         super().__init__()
         self.remote_aliases = remote_aliases
         self.deleted = []
+        self.refreshed = []
+        self.alias_list_calls = 0
 
     def get_aliases_for_account(self, acc_id):
+        self.alias_list_calls += 1
         return list(self.remote_aliases)
 
-    def delete_alias_for_account(self, acc_id, anonymous_id):
+    def refresh_alias_counts(self, acc_id):
+        self.refreshed.append(acc_id)
+
+    def delete_alias_for_account(self, acc_id, anonymous_id, refresh_counts=True):
         self.deleted.append((acc_id, anonymous_id))
         return True
 
@@ -397,4 +403,54 @@ def test_delete_mailbox_local_only_skips_apple(tmp_path):
     assert "仅清理本地记录" in result["warning"]
     assert manager.deleted == []
     assert [item["alias_email"] for item in svc.list_mailboxes()] == ["local@icloud.com"]
+
+
+def test_delete_mailboxes_queries_apple_once_per_account(tmp_path):
+    """批量删除不能按邮箱数放大 Apple 请求：每账号最多查一次别名表。"""
+    latest = latest_file(tmp_path)
+    manager = DeletingManager([
+        {"hme": "alias@icloud.com", "anonymousId": "anon-1"},
+        {"hme": "local@icloud.com", "anonymousId": "anon-2"},
+    ])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    summary = svc.delete_mailboxes(["alias@icloud.com", "local@icloud.com", "alias@icloud.com"], pause=0)
+
+    assert summary["requested"] == 2
+    assert summary["deleted"] == 2
+    assert summary["remote_deleted"] == 2
+    assert summary["failed"] == 0
+    assert manager.alias_list_calls == 1
+    assert manager.refreshed == ["acc_1"]
+    assert manager.deleted == [("acc_1", "anon-1"), ("acc_1", "anon-2")]
+    assert latest.read_text(encoding="utf-8").strip() == ""
+
+
+def test_delete_mailboxes_reports_per_alias_failures(tmp_path):
+    latest = latest_file(tmp_path)
+    manager = DeletingManager([{"hme": "local@icloud.com", "anonymousId": "anon-2"}])
+    svc = MailboxService(manager, latest_emails_path=latest, index_path=tmp_path / "idx.json")
+
+    summary = svc.delete_mailboxes(["alias@icloud.com", "local@icloud.com", "ghost@icloud.com"], pause=0)
+
+    by_alias = {item["alias_email"]: item for item in summary["results"]}
+    assert by_alias["local@icloud.com"]["ok"] is True
+    assert by_alias["alias@icloud.com"]["ok"] is True
+    assert "Apple 侧已不存在" in by_alias["alias@icloud.com"]["warning"]
+    assert by_alias["ghost@icloud.com"]["code"] == "not_found"
+    assert summary["deleted"] == 2
+    assert summary["failed"] == 1
+
+
+def test_delete_mailboxes_marks_unresolved_when_lookup_fails(tmp_path):
+    svc = MailboxService(
+        DeletingManager([]),
+        latest_emails_path=latest_file(tmp_path),
+        index_path=tmp_path / "idx.json",
+    )
+
+    summary = svc.delete_mailboxes(["alias@icloud.com"], pause=0)
+
+    assert summary["deleted"] == 0
+    assert summary["results"][0]["code"] == "alias_id_unresolved"
 
