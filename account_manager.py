@@ -43,6 +43,8 @@ DEFAULT_GROUP_NAME = "可用"
 DEFAULT_GROUP_COLOR = "#1f8b4c"
 UNAVAILABLE_GROUP_ID = "grp_unavailable"
 DEPRECATED_GROUP_ID = "grp_deprecated"
+CLAUDE_GROUP_ID = "grp_claude"
+OPENAI_GROUP_ID = "grp_openai"
 BUILTIN_GROUP_DEFINITIONS = (
     {
         "id": DEFAULT_GROUP_ID,
@@ -66,6 +68,22 @@ BUILTIN_GROUP_DEFINITIONS = (
         "description": "不再使用的 HME 邮箱",
         "color": "#6b7280",
         "sort_order": 2,
+        "is_default": False,
+    },
+    {
+        "id": CLAUDE_GROUP_ID,
+        "name": "Claude",
+        "description": "用于 Claude 的 HME 邮箱",
+        "color": "#8b4513",
+        "sort_order": 3,
+        "is_default": False,
+    },
+    {
+        "id": OPENAI_GROUP_ID,
+        "name": "OpenAI",
+        "description": "用于 OpenAI 的 HME 邮箱",
+        "color": "#147a43",
+        "sort_order": 4,
         "is_default": False,
     },
 )

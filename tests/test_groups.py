@@ -127,8 +127,31 @@ def test_legacy_accounts_file_gets_default_group_and_mailbox_mapping(monkeypatch
     assert "group_id" not in saved["accounts"]["acc_legacy"]
     assert saved["mailbox_groups"] == {"vip@icloud.com": "grp_vip"}
     groups = manager.list_groups()
-    assert [group["name"] for group in groups[:3]] == ["可用", "不可用", "废弃"]
-    assert all(group.get("is_system") is True for group in groups[:3])
+    assert [group["name"] for group in groups[:5]] == ["可用", "不可用", "废弃", "Claude", "OpenAI"]
+    assert all(group.get("is_system") is True for group in groups[:5])
+
+
+def test_builtin_groups_include_provider_groups_and_stay_readonly(monkeypatch, tmp_path):
+    patch_account_files(monkeypatch, tmp_path)
+    seed_accounts_file(tmp_path, {"accounts": {}})
+    manager = AccountManager()
+
+    assert {account_manager.CLAUDE_GROUP_ID, account_manager.OPENAI_GROUP_ID} <= BUILTIN_GROUP_IDS
+    assert manager.get_group(account_manager.CLAUDE_GROUP_ID)["name"] == "Claude"
+    assert manager.get_group(account_manager.OPENAI_GROUP_ID)["name"] == "OpenAI"
+
+    moved = manager.move_mailboxes_to_group(["a@icloud.com"], account_manager.OPENAI_GROUP_ID)
+    assert moved == 1
+    assert manager.get_mailbox_group("a@icloud.com")["id"] == account_manager.OPENAI_GROUP_ID
+
+    # 自定义分组仍可追加，内置分组不可编辑或删除。
+    custom = manager.add_group(name="Gemini", color="#2266dd")
+    assert custom["id"] in group_ids(manager)
+    for builtin in (account_manager.CLAUDE_GROUP_ID, account_manager.OPENAI_GROUP_ID):
+        with pytest.raises(ValueError):
+            manager.update_group(builtin, name="X")
+        with pytest.raises(ValueError):
+            manager.delete_group(builtin)
 
 
 def test_account_manager_group_lifecycle_reorder_mailbox_move_and_delete(monkeypatch, tmp_path):

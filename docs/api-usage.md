@@ -526,7 +526,7 @@ GET /api/shared/<redemption_code>/latest?force=0
 | `GET` | `/api/state` | 当前运行状态、账号和别名统计 |
 | `GET` | `/api/accounts` | 本地账号列表和邮箱分组摘要，敏感字段已过滤 |
 | `POST` | `/api/accounts/add` | 导入账号 Cookie |
-| `GET` | `/api/groups` | 获取本地邮箱分组列表，默认内置 `可用`、`不可用`、`废弃` |
+| `GET` | `/api/groups` | 获取本地邮箱分组列表，内置 `可用`、`不可用`、`废弃`、`Claude`、`OpenAI`（只读），可另建自定义分组 |
 | `POST` | `/api/groups` | 创建自定义邮箱分组 |
 | `PUT` | `/api/groups/{id}` | 更新自定义邮箱分组 |
 | `DELETE` | `/api/groups/{id}` | 删除自定义邮箱分组，邮箱回到“可用”分组 |
