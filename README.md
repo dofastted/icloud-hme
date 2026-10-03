@@ -115,6 +115,16 @@ PORT=8080 docker compose up -d --build
 
 容器无法使用 Windows Chrome Cookie 自动提取；请在 Web UI 中导入 Cookie，或通过 API 导入。
 
+#### hostdzire 生产入口
+
+- 管理首页：`https://icloud.aiforonly.com/`。浏览器通过 Nginx HTTP Basic 登录后可访问管理页面及管理接口；管理登录密码不是 API Key。
+- 公共共享入口：`https://icloud.aiforonly.com/shared`。共享页面、兑换和读取接口不要求管理登录；外部 `/api/v1/*` 仍独立校验 API Key。
+- API Key 管理页面使用 `X-API-Key` 请求头，避免覆盖浏览器用于管理登录的 `Authorization: Basic ...`。
+- 服务位于 `/opt/icloud-hme`，运行数据位于 `/opt/icloud-hme/data`，容器只绑定 `127.0.0.1:5050`。Nginx 登录摘要保存在 `/etc/nginx/icloud-hme.htpasswd`，不在项目或数据目录内保存明文管理密码。
+- 本地与服务器数据不会自动同步。线上兑换码应在服务器管理页生成或吊销；迁移后继续操作本地库不会更新线上分享。
+- 本机 5050 服务已停止，Windows 计划任务 `iCloud HME Web UI` 已禁用，WSL 启动链已移除 HME 启动段；本地账号、分享及缓存文件仍保留。
+
+
 
 ### 命令行调度器
 
