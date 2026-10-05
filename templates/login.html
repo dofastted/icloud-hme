@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理员登录</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body class="login-page">
+  <main class="login-screen">
+    <form id="loginForm" class="login-card">
+      <div class="logo"><span class="diamond-mark"></span>iCloud HME</div>
+      <h1>管理员登录</h1>
+      <label class="label">账号
+        <input name="username" autocomplete="username" required>
+      </label>
+      <label class="label">密码
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="loginError" class="login-error" hidden></p>
+      <button class="btn btn-primary" type="submit">登录</button>
+    </form>
+  </main>
+  <script>
+    document.getElementById("loginForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const error = document.getElementById("loginError");
+      error.hidden = true;
+      error.textContent = "";
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            username: form.username.value,
+            password: form.password.value,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          error.textContent = data.error || "登录失败";
+          error.hidden = false;
+          return;
+        }
+        location.assign("/");
+      } catch (err) {
+        error.textContent = "登录失败";
+        error.hidden = false;
+      }
+    });
+  </script>
+</body>
+</html>

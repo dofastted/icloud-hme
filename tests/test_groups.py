@@ -8,6 +8,7 @@ import web_ui
 from account_manager import AccountManager, BUILTIN_GROUP_IDS, DEFAULT_GROUP_COLOR, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID
 from mailbox_service import MailboxService
 from shared_mailboxes import SharedMailboxStore
+from tests.support import login_admin
 
 
 class FakeHME:
@@ -213,7 +214,7 @@ def configure_web_ui(monkeypatch, tmp_path):
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
     monkeypatch.setattr(web_ui, "_shared_store", store)
     monkeypatch.setattr(web_ui, "_mailbox_service", service)
-    return web_ui.app.test_client(), manager, service.index_path
+    return login_admin(web_ui.app.test_client()), manager, service.index_path
 
 
 def test_api_groups_crud_mailbox_group_updates_and_account_sanitizing(monkeypatch, tmp_path):

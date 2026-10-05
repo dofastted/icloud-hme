@@ -9,6 +9,7 @@ import types
 
 import account_manager
 import web_ui
+from tests.support import login_admin
 from account_manager import AccountManager
 
 
@@ -162,7 +163,7 @@ def test_state_endpoint_corrects_stale_running_flag(monkeypatch):
     monkeypatch.setattr(web_ui, "_account_mgr", Manager())
     monkeypatch.setattr(web_ui, "_scheduler_thread", DeadThread())
     web_ui._global_state["running"] = True
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     payload = client.get("/api/state").get_json()
 
@@ -234,7 +235,7 @@ def test_batch_create_reports_failure_not_success(monkeypatch):
 
     monkeypatch.setattr(web_ui, "_account_mgr", FailingManager())
     monkeypatch.setattr(web_ui, "_emit_log", lambda level, msg, tag="": logs.append((level, msg)))
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     payload = client.post("/api/create-batch", json={"account_ids": ["a1"], "count_per_account": 1}).get_json()
 
@@ -256,7 +257,7 @@ def test_batch_stream_emits_per_item_events(monkeypatch):
     created = iter([(True, "one@icloud.com"), (True, "two@icloud.com")])
     monkeypatch.setattr(web_ui, "_account_mgr", Manager())
     monkeypatch.setattr(web_ui, "_create_scheduled_alias", lambda acc_id, name: next(created))
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     response = client.post("/api/create-batch-stream", json={"account_ids": ["a1"], "count_per_account": 2, "interval": 0})
     events = _sse_events(response)
@@ -285,7 +286,7 @@ def test_batch_stream_stops_account_on_limit_error(monkeypatch):
 
     monkeypatch.setattr(web_ui, "_account_mgr", Manager())
     monkeypatch.setattr(web_ui, "_create_scheduled_alias", create)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     response = client.post("/api/create-batch-stream", json={"account_ids": ["a1"], "count_per_account": 5, "interval": 0})
     events = _sse_events(response)
@@ -305,7 +306,7 @@ def test_batch_stream_rejects_inactive_account(monkeypatch):
 
     monkeypatch.setattr(web_ui, "_account_mgr", Manager())
     monkeypatch.setattr(web_ui, "_create_scheduled_alias", lambda *a: (_ for _ in ()).throw(AssertionError("不应创建")))
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     response = client.post("/api/create-batch-stream", json={"account_ids": ["a1"], "count_per_account": 2})
     events = _sse_events(response)
@@ -342,7 +343,7 @@ def test_mail_probe_config_validates_and_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(web_ui, "MAIL_PROBE_STATE_FILE", state_file)
     started = []
     monkeypatch.setattr(web_ui, "_start_mail_probe_thread", lambda: started.append(True) or True)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     saved = client.put(
         "/api/mail-probe/config",
@@ -391,7 +392,7 @@ def test_mail_probe_toggle_keeps_watcher_thread_armed(monkeypatch, tmp_path):
     monkeypatch.setattr(web_ui, "MAIL_PROBE_CONFIG_FILE", tmp_path / "mail_probe_config.json")
     monkeypatch.setattr(web_ui, "MAIL_PROBE_STATE_FILE", tmp_path / "mail_probe_state.json")
     monkeypatch.setattr(web_ui, "_run_mail_probe_once", lambda config=None: True)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
     web_ui._stop_mail_probe_thread()
     web_ui._mail_probe_thread = None
 
@@ -419,7 +420,7 @@ def test_mail_probe_next_trigger_respects_window_and_interval():
 
 def test_mail_probe_run_uses_mailbox_compatibility_path(monkeypatch):
     monkeypatch.setattr(web_ui, "_run_mail_probe_once", lambda: True)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     response = client.post("/api/mailboxes/probe")
 

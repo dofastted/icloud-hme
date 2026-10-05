@@ -6,6 +6,7 @@ import web_ui
 from account_manager import AccountManager
 from mailbox_service import MailboxService
 from shared_mailboxes import SharedMailboxStore
+from tests.support import login_admin
 
 
 class RemoteFailingMailboxManager:
@@ -59,7 +60,7 @@ def _install_web_dependencies(monkeypatch, tmp_path, manager):
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
     monkeypatch.setattr(web_ui, "_shared_store", store)
     monkeypatch.setattr(web_ui, "_mailbox_service", MailboxService(manager, store, latest, tmp_path / "mailbox_index.json"))
-    return web_ui.app.test_client()
+    return login_admin(web_ui.app.test_client())
 
 
 def _validation_state(payload):
@@ -151,7 +152,7 @@ def test_logs_history_endpoint_returns_recent_emitted_entries(monkeypatch):
         web_ui._log_buffer.clear()
     if hasattr(web_ui, "_log_seq"):
         web_ui._log_seq = 0
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     web_ui._emit_log("info", "first historical line")
     web_ui._emit_log("warn", "second historical line")

@@ -8,6 +8,7 @@ import imaplib
 
 from icloud_mail import ICloudMail
 import web_ui
+from tests.support import login_admin
 
 
 class FakeMailSettingsManager:
@@ -247,7 +248,7 @@ def test_get_mail_client_uses_forwarding_mailbox_host():
 def test_admin_mail_settings_saves_generic_login_without_exposing_secret(monkeypatch):
     manager = FakeMailSettingsManager()
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     res = client.post(
         "/api/accounts/acc_1/mail-settings",
@@ -270,7 +271,7 @@ def test_admin_mail_settings_saves_generic_login_without_exposing_secret(monkeyp
 def test_admin_mail_settings_test_endpoint_reads_saved_imap(monkeypatch):
     manager = FakeMailSettingsManager()
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     client.post(
         "/api/accounts/acc_1/mail-settings",
@@ -398,7 +399,7 @@ def test_imap_config_api_creates_sanitized_config_and_account_can_select(monkeyp
 
     monkeypatch.setattr(manager, "test_mail_connection", fake_test_mail_connection)
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     created = client.post(
         "/api/imap-configs",

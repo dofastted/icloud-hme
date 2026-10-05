@@ -23,6 +23,9 @@ icloud_cookies.json
 accounts.json
 scheduler_state.json
 api_keys.json
+admin.json
+admin.json.tmp
+admin_secret.key
 shared_mailboxes.json
 test-acc-session.txt
 latest_emails.txt

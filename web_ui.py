@@ -10,10 +10,11 @@ from zoneinfo import ZoneInfo
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
-from flask import Flask, Response, request, jsonify, render_template, g
+from flask import Flask, Response, request, jsonify, render_template, g, session
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager, SCHEDULER_ALIAS_LIMIT, CREATE_INTERVAL_SEC, DEFAULT_GROUP_ID, UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID, account_alias_total, account_reached_scheduler_limit, scheduler_eligible_accounts, scheduler_count_needs_refresh, account_has_mail_config, account_mail_email, account_mail_host, infer_mail_host
 from api_keys import APIKeyStore, extract_api_key
+from admin_auth import AdminAuthStore
 from mailbox_service import AliasRemoteIdUnavailable, IMAPNotConfigured, IMAPUnavailable, MailboxNotFound, MailboxService, normalize_mailbox_sort
 from run_log import RunLogStore, date_key
 from shared_mailboxes import SharedMailboxStore
@@ -44,6 +45,9 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 API_AVAILABLE_EXCLUDED_GROUP_IDS = {UNAVAILABLE_GROUP_ID, DEPRECATED_GROUP_ID}
 app = Flask(__name__)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("HME_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on")
 _log_queue = queue.Queue()
 _log_buffer = deque(maxlen=500)
 _log_lock = threading.Lock()
@@ -63,6 +67,7 @@ _mail_probe_wake_event = threading.Event()
 _mail_probe_run_lock = threading.Lock()
 _account_mgr = AccountManager()
 _api_keys = APIKeyStore()
+_admin_auth = AdminAuthStore()
 _shared_store = SharedMailboxStore()
 _mailbox_service = MailboxService(_account_mgr, _shared_store)
 _log_store = RunLogStore(LOGS_DIR)
@@ -836,9 +841,92 @@ def _health_loop():
 
 # ----- Flask Routes -----
 
+def _admin_secret_path() -> Path:
+    override = os.environ.get("HME_ADMIN_SECRET_FILE", "").strip()
+    if override:
+        return Path(override)
+    return DATA_DIR / "admin_secret.key"
+
+
+def _ensure_admin_secret():
+    if app.secret_key:
+        return
+    path = _admin_secret_path()
+    try:
+        key = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError:
+        key = ""
+    if not key:
+        key = secrets.token_hex(32)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(key, encoding="utf-8")
+        except OSError:
+            _emit_log("warn", "管理员会话密钥写入失败")
+    app.secret_key = key
+
+
+def _credential_text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _is_public_admin_api() -> bool:
+    path = request.path
+    method = request.method
+    if path == "/api/v1" or path.startswith("/api/v1/"):
+        return True
+    if method == "POST" and path in ("/api/login", "/api/logout"):
+        return True
+    if path in ("/api/shared/latest", "/api/shared/redeem") and method in ("GET", "POST"):
+        return True
+    if method == "GET" and path.startswith("/api/shared/") and path.endswith("/latest"):
+        return True
+    return False
+
+
+@app.before_request
+def _require_admin_session():
+    if not request.path.startswith("/api/"):
+        return None
+    _ensure_admin_secret()
+    if _is_public_admin_api():
+        return None
+    if session.get("admin") is True:
+        return None
+    return jsonify({"ok": False, "error": "未登录"}), 401
+
+
 @app.route("/")
 @app.route("/index.html")
-def index(): return render_template("index.html")
+def index():
+    _ensure_admin_secret()
+    if session.get("admin") is True:
+        return render_template("index.html")
+    return render_template("login.html")
+
+
+@app.route("/api/login", methods=["POST"])
+def api_admin_login():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    username = _credential_text(data.get("username"))
+    password = _credential_text(data.get("password"))
+    if not _admin_auth.verify(username, password):
+        _emit_log("warn", "管理员登录失败")
+        return jsonify({"ok": False, "error": "账号或密码错误"}), 401
+    _ensure_admin_secret()
+    session["admin"] = True
+    session.permanent = False
+    return jsonify({"ok": True})
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_admin_logout():
+    _ensure_admin_secret()
+    session.clear()
+    return jsonify({"ok": True})
+
 
 @app.route("/api/keys", methods=["POST"])
 def api_keys_create():

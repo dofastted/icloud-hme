@@ -2,6 +2,7 @@ import queue
 from datetime import datetime, timedelta
 
 import web_ui
+from tests.support import login_admin
 from run_log import RunLogStore, resolve_retention_days
 
 
@@ -99,7 +100,7 @@ def test_logs_endpoint_falls_back_to_disk_after_restart(monkeypatch, tmp_path):
     store = _isolate_logs(monkeypatch, tmp_path)
     store.append({"seq": 1, "date": "20260822", "time": "09:00:00", "level": "info", "msg": "before restart"})
     web_ui._log_buffer.clear()
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     payload = client.get("/api/logs").get_json()
 
@@ -113,7 +114,7 @@ def test_logs_endpoint_reads_requested_past_date(monkeypatch, tmp_path):
     store.append({"seq": 1, "date": "20260820", "time": "08:00:00", "level": "info", "msg": "two days ago"})
     monkeypatch.setattr(web_ui, "_now", lambda: datetime(2026, 8, 22, 10, 0, 0))
     web_ui._emit_log("info", "today line")
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     payload = client.get("/api/logs?date=20260820").get_json()
 

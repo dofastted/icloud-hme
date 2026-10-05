@@ -1,4 +1,5 @@
 import web_ui
+from tests.support import login_admin
 from api_keys import APIKeyStore
 from mailbox_service import MailboxService
 from shared_mailboxes import SharedMailboxStore
@@ -101,7 +102,7 @@ def configure_manager(monkeypatch, tmp_path, manager):
     monkeypatch.setattr(web_ui, "_shared_store", store)
     monkeypatch.setattr(web_ui, "_mailbox_service", MailboxService(manager, store, latest, tmp_path / "mailbox_index.json"))
     monkeypatch.setattr(web_ui, "_api_keys", api_keys)
-    return web_ui.app.test_client(), key, store
+    return login_admin(web_ui.app.test_client()), key, store
 
 
 def configure(monkeypatch, tmp_path):
@@ -115,7 +116,7 @@ def configure(monkeypatch, tmp_path):
     monkeypatch.setattr(web_ui, "_shared_store", store)
     monkeypatch.setattr(web_ui, "_mailbox_service", MailboxService(manager, store, latest, tmp_path / "mailbox_index.json"))
     monkeypatch.setattr(web_ui, "_api_keys", api_keys)
-    return web_ui.app.test_client(), key, store
+    return login_admin(web_ui.app.test_client()), key, store
 
 
 def test_v1_mailboxes_requires_api_key(monkeypatch, tmp_path):

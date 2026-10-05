@@ -18,6 +18,7 @@
         const err = new Error(data.error || ('HTTP ' + res.status));
         err.code = data.code || '';
         err.status = res.status;
+        if (res.status === 401 && data.error === '未登录') location.assign('/');
         throw err;
       }
       return data;
@@ -115,6 +116,12 @@
     if (!action) return;
     if (action === 'refresh') refreshAll();
     if (action === 'add-account') HME.showAddAccountModal();
+    if (action === 'logout') {
+      try { await S.api('/api/logout', {method:'POST'}); }
+      catch (err) { /* 离开页面；清 cookie 失败也回到登录页 */ }
+      location.assign('/');
+      return;
+    }
     if (action === 'toggle-scheduler') {
       try {
         await S.api('/api/scheduler/' + (S.state.running ? 'stop' : 'start'), {method:'POST'});

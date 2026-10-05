@@ -1,4 +1,5 @@
 import web_ui
+from tests.support import login_admin
 
 
 class FakeSessionManager:
@@ -62,7 +63,7 @@ def test_account_session_endpoint_reads_and_updates(monkeypatch):
     monkeypatch.setattr(web_ui, "_account_mgr", manager)
     monkeypatch.setattr(web_ui, "_start_validation_worker", lambda: None)
     web_ui._validation_jobs.clear()
-    client = web_ui.app.test_client()
+    client = login_admin(web_ui.app.test_client())
 
     read_resp = client.get("/api/accounts/acc_1/session")
     assert read_resp.status_code == 200
