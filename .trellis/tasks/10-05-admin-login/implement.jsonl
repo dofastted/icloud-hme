@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/10-05-admin-login/research/auth-boundary.md", "reason": "Route split and the selected gate: lock management UI and /api, keep v1 keys and public redeem"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Login page, session cookie, and API before_request must enforce one boundary"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Match APIKeyStore file, lock, and digest style instead of a second credential design"}
